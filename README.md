@@ -1,249 +1,72 @@
 # fido2-ble-bridge
 
-Use a **Bluetooth LE FIDO2 security key** (for example one with a fingerprint sensor) on Linux
-exactly like a USB key: desktop login, the lock screen, `sudo` and polkit through `pam_u2f`,
-plus anything else built on libfido2. No cable, and no changes to `pam_u2f` or libfido2.
+Log in with a **Bluetooth LE FIDO2 security key** and its fingerprint sensor, with no cable.
+The key stays a standard FIDO2 authenticator. Each platform gets a small component that lets
+its own login stack use the key over Bluetooth LE.
 
-The Linux FIDO stack (libfido2, and with it `pam_u2f`, OpenSSH and systemd) only speaks USB HID
-and NFC. This daemon gives a bonded BLE key a virtual USB FIDO device (via the kernel's `uhid`)
-and relays CTAP2 messages between the two, unchanged.
-
-```
-pam_u2f / libfido2 ──► /dev/hidrawN (virtual, uhid) ──► fido2-ble-bridge ──► BlueZ ──► your key
-                         CTAPHID, as for a USB key                 bonded, encrypted BLE link
-```
-
-## Security model
-
-**The bridge cannot log anyone in.** It is a transport. `pam_u2f` sends a fresh random
-challenge, the key signs it with a private key that never leaves the key, and `pam_u2f`
-verifies that signature against the public key registered for your account. The bridge never
-holds key material, so a compromised bridge, a spoofed Bluetooth device or a radio attacker can
-only make a login fail. The end-to-end tests include exactly that case: a key that answers for
-the right credential with the wrong private key is refused by the real `pam_u2f`.
-
-On top of that:
-
-- **Pinned, bonded key only.** The bridge connects only to the address in its config, and only
-  if BlueZ reports it as paired *and* bonded. For a device bonded over LE, which is how FIDO
-  keys pair, BlueZ requires link encryption with the stored long-term key as it connects
-  (checked in BlueZ's `device.c`). So a device copying your key's address without that key
-  cannot complete a connection, as CTAP 2.1 section 11.4 requires. Newer BlueZ reports the LE
-  bond separately and the bridge checks that too. On older BlueZ (5.72 in Ubuntu 24.04) a bond
-  made over classic Bluetooth would also pass, which only matters if the configured address
-  belongs to a dual-mode device rather than your key.
-- **Local logins only.** The shipped PAM profile uses the key only for local services (display
-  managers, lock screens, `sudo`, `su`, console login, polkit). A remote password attempt over
-  `sshd` never reaches the key, so a stranger cannot make it ask for your fingerprint.
-- **Fingerprint, not just presence.** The recommended PAM line uses `userverification=1`. The
-  key must verify your fingerprint itself, so a stolen key alone does not get in.
-- **CTAP2 only.** Legacy U2F messages, which cannot verify the user, are refused.
-- **Strict, bounded parsing** of every HID report and BLE fragment. Message sizes are capped at
-  the protocol maxima, the notification queue is bounded, and a malformed stream drops the link.
-- **Nothing sensitive in the logs.** The bridge never logs message contents, and `-v` leaves the
-  payload-level debug output of `bleak` and `dbus-fast` switched off.
-- **Bounded in time.** Every request has a hard deadline (`request_timeout`), so a misbehaving
-  key or Bluetooth stack cannot hang a login prompt.
-- **Sandboxed service.** It runs as a throwaway `DynamicUser` with no capabilities, no network
-  (D-Bus only), a read-only filesystem, an empty private `/dev`, and a system-call filter.
-  systemd opens the root-only `/dev/uhid` and passes the service just that file descriptor
-  (`OpenFile=`), so no device permissions or groups are loosened. See
-  `packaging/fido2-ble-bridge.service`.
-- **Pinned dependencies.** The installer installs runtime dependencies (`bleak`, `dbus-fast`)
-  from binary wheels only, verified against hashes from `uv.lock`.
-
-What it does **not** protect against:
-
-- **Other local processes using the key through BlueZ.** Bluetooth pairing is system-wide, and
-  BlueZ's default D-Bus policy lets any local user talk to a bonded device. So any process on
-  this machine can connect to your key directly and ask it to sign. Each signature still needs
-  your fingerprint on the key. This is the "system-wide pairing" caveat of CTAP 2.1 section
-  11.4.13.1 and applies to every BLE security key on Linux. To narrow it, restrict
-  `org.bluez` to the `bluetooth` group in `/etc/dbus-1/system.d/bluetooth.conf`; that also
-  hides Bluetooth from desktop users outside the group.
-- **Root on this machine**, which can drive the key as it could a USB key.
-- **Someone with your key and your finger.**
-- **Relay attacks**, which forward your key's radio from a distance while you touch it.
-- **Radio jamming**, which only makes the login fall back to your password.
-
-The virtual hidraw node itself is reachable only by root and the logged-in desktop user, through
-systemd's standard FIDO udev rules (`60-fido-id.rules` with `uaccess`). See
-[SECURITY.md](SECURITY.md).
-
-## Requirements
-
-- Linux with BlueZ ≥ 5.65 (it must report `Bonded`), systemd ≥ 253 (for `OpenFile=`) and the
-  `uhid` kernel module: Ubuntu 24.04+, Debian 13+, current Fedora and Arch
-- Python ≥ 3.11 with `venv` (`apt install python3-venv` on Debian/Ubuntu)
-- `pam_u2f` ≥ 1.1 and libfido2 tools: `apt install libpam-u2f pamu2fcfg fido2-tools`
-- A FIDO2 key that supports the BLE transport (CTAP 2.1 section 11.4)
-
-## Setup
-
-### 1. Pair the key with BlueZ
-
-Put the key in Bluetooth pairing mode (see its manual), then:
-
-```console
-$ bluetoothctl
-[bluetooth]# agent KeyboardDisplay
-[bluetooth]# default-agent
-[bluetooth]# scan le
-[bluetooth]# pair AA:BB:CC:DD:EE:FF        # type the passkey if the key asks for one
-[bluetooth]# trust AA:BB:CC:DD:EE:FF
-[bluetooth]# info AA:BB:CC:DD:EE:FF        # expect "Paired: yes" and "Bonded: yes"
-```
-
-Pair somewhere private: pairing is the moment an attacker nearby could get in the middle.
-`fido2-ble-bridge scan` (after step 2) lists nearby keys that advertise FIDO over BLE.
-
-### 2. Install
-
-```console
-$ git clone https://github.com/mos-ks/fido2-ble-bridge
-$ cd fido2-ble-bridge
-$ sudo ./packaging/install.sh
-```
-
-This loads `uhid` at boot, creates `/opt/fido2-ble-bridge`, installs the systemd unit and the
-`fido2-ble-bridge` command, and writes `/etc/fido2-ble-bridge/config.toml` on first install.
-It does not touch your PAM configuration.
-
-### 3. Configure and check
-
-Set your key's address in `/etc/fido2-ble-bridge/config.toml`, then wake the key and run:
-
-```console
-$ fido2-ble-bridge check
-Waiting up to 10s for AA:BB:CC:DD:EE:FF: wake the key now.
-OK: bonded and encrypted link, FIDO2 selected, fragment size …, getInfo returned … bytes.
-$ sudo systemctl enable --now fido2-ble-bridge
-$ fido2-token -L                     # the bridge shows up as a USB FIDO device
-/dev/hidraw5: vendor=0x0000, product=0x0000 ( )
-$ fido2-token -I /dev/hidraw5        # with the key awake: its real getInfo
-```
-
-### 4. Fingerprint
-
-If the key has no fingerprint enrolled yet, you can enroll one through the bridge. A PIN must
-be set first:
-
-```console
-$ fido2-token -S /dev/hidraw5          # set a PIN, if none is set
-$ fido2-token -S -e /dev/hidraw5       # enroll a fingerprint (touch the sensor repeatedly)
-```
-
-`fido2-token -I` should then list `uv` among the options. The vendor's own app works too.
-
-### 5. Register the key for your account
-
-With the key awake:
-
-```console
-$ pamu2fcfg -u "$USER" -o pam://fido2-ble-bridge -i pam://fido2-ble-bridge -V \
-    | sudo tee /etc/fido2-ble-bridge/u2f_mappings
-```
-
-`-V` makes the fingerprint mandatory for this credential. For more users, append one line per
-user. To add a backup key to the same user, append the output of `pamu2fcfg -n …` to that user's
-line.
-
-### 6. Test, then enable PAM
-
-Keep a root shell open until you have tested a fresh login, so a mistake cannot lock you out.
-
-```console
-$ sudo apt install pamtester
-$ echo 'auth required pam_u2f.so authfile=/etc/fido2-ble-bridge/u2f_mappings origin=pam://fido2-ble-bridge cue userverification=1' \
-    | sudo tee /etc/pam.d/fido2-ble-test
-$ pamtester fido2-ble-test "$USER" authenticate      # wake the key, touch the sensor
-pamtester: successfully authenticated
-$ sudo rm /etc/pam.d/fido2-ble-test
-$ sudo pam-auth-update --enable fido2-ble-bridge
-```
-
-This puts the key in front of your password in `common-auth`, guarded so it applies only to
-local services: `gdm-password` (GNOME login and lock screen), `sddm`, `kde`, `lightdm`, common
-screen lockers, `sudo`, `sudo-i`, `su`, `su-l`, `login` and `polkit-1`. Remote services such as
-`sshd` skip it and ask for the password as before. To add a local service, append its PAM
-service name to the `service in …` list in `/usr/share/pam-configs/fido2-ble-bridge` and rerun
-`sudo pam-auth-update --enable fido2-ble-bridge`. If the key is absent or fails, you get the
-password prompt. To undo: `sudo pam-auth-update --disable fido2-ble-bridge`.
-
-`pam-auth-update` exists on Debian and Ubuntu. Elsewhere, add this line before the password
-module in the PAM files of the local services you want (for example `/etc/pam.d/sudo`):
-
-```
-auth sufficient pam_u2f.so authfile=/etc/fido2-ble-bridge/u2f_mappings origin=pam://fido2-ble-bridge cue userverification=1
-```
-
-## Using it
-
-At a login prompt, wake the key (before or after starting the login). The bridge waits up to
-`connect_timeout` seconds for it, then `pam_u2f` shows "Please touch the device." and you touch
-the sensor. If the key does not appear in time, you get the password prompt.
-
-- **Wait time without the key.** When you log in without the key nearby, each prompt first waits
-  `connect_timeout` seconds. Lower it in the config if that bothers you.
-- **GNOME keyring.** The login keyring is encrypted with your password, so after a passwordless
-  login GNOME asks for that password the first time something needs the keyring. This is a
-  general consequence of passwordless login, not specific to this bridge.
-- **Browsers.** Chrome and Firefox look for security keys on hidraw, so they should find the
-  bridge for WebAuthn too. This is untested.
-
-## Configuration
-
-`/etc/fido2-ble-bridge/config.toml`; unknown keys are rejected.
-
-| Key | Default | Meaning |
+| Platform | What it does | Guide |
 | --- | --- | --- |
-| `address` | (required) | Bluetooth address of the bonded key |
-| `adapter` | system default | Bluetooth adapter, e.g. `hci1` |
-| `connect_timeout` | `10` | Seconds a request waits for the key to connect (1 to 120) |
-| `request_timeout` | `60` | Further seconds one request may take, fingerprint wait included (5 to 300) |
-| `idle_disconnect` | `10` | Seconds the link stays open after the last request (0 to 600) |
-| `device_name` | `FIDO2 BLE bridge` | Name of the virtual HID device |
+| Linux | A daemon that turns a bonded BLE key into a virtual USB FIDO key (kernel `uhid`), so `pam_u2f` and libfido2 work unchanged: desktop login, lock screen, `sudo` | [linux/README.md](linux/README.md) |
+| Windows | `Fido2BleLogon`, a credential provider: a logon tile for local accounts, unlocked with the key's fingerprint | [windows/README.md](windows/README.md) |
 
-## Troubleshooting
+## Linux
 
-- `journalctl -u fido2-ble-bridge -f` shows connections, timeouts and refusals.
-- `check` says **not bonded**: pair and trust the key again (step 1); `info` must show
-  `Bonded: yes`.
-- `check` says **does not offer FIDO2 over BLE**: the key has no FIDO2 BLE service, or only
-  legacy U2F over BLE, which this bridge does not support.
-- `check` times out: wake the key and make sure it is not connected to another device (a
-  phone, for example) or to this computer through the desktop's Bluetooth settings. A
-  connected key does not advertise, so the bridge cannot find it.
-- `fido2-ble-bridge -v check` adds debug logs from the bridge only; message contents are never
-  logged.
-- `pamu2fcfg` registers the wrong key: it uses the first FIDO device it finds, so unplug other
-  security keys while registering.
+The bridge in [`linux/`](linux/README.md) is a Python service for systemd. It needs BlueZ
+≥ 5.65, systemd ≥ 253, the `uhid` kernel module and a key that supports FIDO2 over BLE
+(CTAP 2.1 section 11.4). It connects only to the one configured key, and only when BlueZ
+reports that key as bonded, and it relays CTAP2 messages unchanged. To install it, run
+`sudo ./install.sh` in `linux/`; its guided setup pairs the key, registers it for your account,
+tests a login and then enables the key for logins. It asks before it installs packages, pairs or
+uses a key (you type `yes` after seeing which device), removes or replaces a pairing or
+registration, sets a PIN or enrolls a finger, and enables PAM, and at the end it lists every
+change with its undo.
 
-## Status
+**Security.** The bridge is only a transport and cannot log anyone in. `pam_u2f` sends a fresh
+challenge, the key signs it with a private key that never leaves the key, and `pam_u2f`
+verifies the signature against the public key registered for the account. A compromised
+bridge, a device spoofing the key's address or a radio attacker can make a login fail, not
+succeed. The recommended setup requires the fingerprint (`userverification=1`). The shipped PAM
+profile uses the key for the login and lock screens, and for `sudo` and the console's `login`
+only when a check finds the request comes from your own session at this computer; never for
+`sshd`, for `sudo` in an SSH session, or for `su` and polkit, which would let another user start
+a login as you and make your key ask. The service runs in a strict systemd sandbox. Other local
+processes can still talk to a bonded key through BlueZ, as with any BLE key on Linux; each
+signature still needs the fingerprint, and what the key signs for them cannot log anyone in.
+[SECURITY.md](SECURITY.md) has the threat model and the hardening list.
 
-Verified by the test suite: the CTAPHID and FIDO-BLE framing against the CTAP 2.1 spec
-examples; the BLE link against a simulated authenticator (handshake, fragmentation with
-sequence wraparound, keepalives, cancel, disconnects, timeouts, refusal of unbonded or
-non-FIDO2 devices); and end to end through the real kernel (`uhid`, hidraw), libfido2's
-`fido2-token`, `pamu2fcfg` and `pam_u2f` with only the radio simulated. That includes a full
-fingerprint login and its refusal on a failed fingerprint or a wrong signature.
+## Windows
 
-**Not yet confirmed on physical BLE keys.** If you try it, please open an issue with the key
-model and the output of `fido2-ble-bridge check`, so this section can list keys that work.
+`Fido2BleLogon` in [`windows/`](windows/README.md) adds a sign-in option to the Windows logon and
+lock screen for **local accounts** (Windows' own security-key sign-in only supports Entra ID
+accounts). It needs Windows 10 version 2004 or later, a FIDO2 key with a fingerprint sensor that
+works over Bluetooth LE and supports the `hmac-secret` and `credProtect` extensions, and the .NET 10
+SDK. To install it, run `setup.cmd` in `windows/`: it builds and installs the tile, pairs the key,
+enrolls your account (your Windows password, then two touches) and makes the tile the preselected
+sign-in option. At the lock screen you press the key's button and touch the sensor.
 
-## Development
+**Security.** Unlike the Linux bridge, the tile signs in with your Windows password, which it
+stores encrypted (AES-256-GCM) under a secret that the key releases only after verifying your
+fingerprint (CTAP2 `hmac-secret` on a credential created with `credProtect` level 3). The tile
+checks the key's signature against the enrolled credential, runs only on the logon and lock
+screen, keeps its files admin-only and clears the password from memory right after use. The
+key's PIN counts like a fingerprint, so use a strong key PIN and turn on device encryption.
+[SECURITY.md](SECURITY.md#windows) has the threat model.
 
-```console
-$ uv sync
-$ uv run pytest            # unit, link and bridge tests
-$ uv run ruff check . && uv run ruff format --check . && uv run mypy
-```
+## Tested hardware
 
-The end-to-end tests in `tests/test_e2e_uhid.py` run when you can write `/dev/uhid` (root-only
-by default; CI loosens it with a udev rule) and `fido2-token`, `pamu2fcfg` and `pam_u2f.so` are
-installed. Point `FIDO2_TOKEN`, `PAMU2FCFG` and `PAM_U2F_SO` at other builds if needed. They
-use `pam_start_confdir`, so they never touch `/etc/pam.d`. CI runs them on every push.
+- **Linux:** verified by the test suite, including end-to-end runs through the real kernel
+  (`uhid`, hidraw), libfido2, `pamu2fcfg` and `pam_u2f` with only the Bluetooth radio
+  simulated. Not yet confirmed on a physical BLE key; if you try one, please report the model
+  as described in [linux/README.md](linux/README.md#status).
+- **Windows:** confirmed on a Feitian AllinPass K33 with Windows 11 (local account): pairing,
+  enrollment and fingerprint sign-in on the real lock screen. The tile is also covered by an offline
+  self-test that drives it the way LogonUI does, and the core by unit tests against a simulated
+  authenticator; see [windows/README.md](windows/README.md).
+
+## Reporting security issues
+
+Privately, through GitHub's "Report a vulnerability" button; see [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT
+MIT; see [LICENSE](LICENSE).

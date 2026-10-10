@@ -1,0 +1,15 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Fido2BleLogon.Cli/Fido2BleLogon.Cli.csproj" />
+    <Project Path="src/Fido2BleLogon.Core/Fido2BleLogon.Core.csproj" />
+    <Project Path="src/Fido2BleLogon.CpHarness/Fido2BleLogon.CpHarness.csproj">
+      <Platform Project="x64" />
+    </Project>
+    <Project Path="src/Fido2BleLogon.CredentialProvider/Fido2BleLogon.CredentialProvider.csproj">
+      <Platform Project="x64" />
+    </Project>
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Fido2BleLogon.Core.Tests/Fido2BleLogon.Core.Tests.csproj" />
+  </Folder>
+</Solution>
