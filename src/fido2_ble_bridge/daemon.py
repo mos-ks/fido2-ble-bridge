@@ -82,6 +82,7 @@ async def run(config: Config) -> None:
     link = FidoBleLink(
         BleakGattConnector(config.address, config.adapter),
         idle_disconnect=config.idle_disconnect,
+        request_timeout=config.request_timeout,
     )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

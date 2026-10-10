@@ -196,6 +196,8 @@ class SimulatedFidoKey:
         error_code: bytes | None = None,
         silent: bool = False,
         disconnect_mid_request: bool = False,
+        keepalive_forever: bool = False,
+        hang_writes: bool = False,
     ) -> None:
         self.authenticator = authenticator
         self._on_disconnect = on_disconnect
@@ -207,6 +209,8 @@ class SimulatedFidoKey:
         self.error_code = error_code
         self.silent = silent
         self.disconnect_mid_request = disconnect_mid_request
+        self.keepalive_forever = keepalive_forever
+        self.hang_writes = hang_writes
         self.connected = True
         self.selected_revision: bytes | None = None
         self.writes: list[bytes] = []
@@ -249,6 +253,8 @@ class SimulatedFidoKey:
     async def write_control_point(self, fragment: bytes) -> None:
         if not self.connected:
             raise OSError("ATT write on a closed link")
+        if self.hang_writes:
+            await asyncio.Event().wait()
         limit = min(int.from_bytes(self.control_point_length, "big"), self.fragment_limit)
         assert len(fragment) <= limit, f"fragment of {len(fragment)} bytes exceeds {limit}"
         self.writes.append(fragment)
@@ -284,6 +290,10 @@ class SimulatedFidoKey:
     async def _process(self, data: bytes) -> None:
         if self.silent:
             return
+        if self.keepalive_forever:
+            while True:
+                self.send_frame(0x82, b"\x01")
+                await asyncio.sleep(self.keepalive_interval)
         if self.disconnect_mid_request:
             await asyncio.sleep(0.01)
             self.drop()

@@ -40,12 +40,14 @@ def make_link(
     connector: SimulatedConnector,
     *,
     idle_disconnect: float = 60.0,
+    request_timeout: float = 60.0,
     silence_timeout: float = 0.5,
     cancel_grace: float = 0.3,
 ) -> FidoBleLink:
     return FidoBleLink(
         connector,
         idle_disconnect=idle_disconnect,
+        request_timeout=request_timeout,
         silence_timeout=silence_timeout,
         cancel_grace=cancel_grace,
     )
@@ -243,15 +245,41 @@ async def test_requests_are_serialised() -> None:
     await link.close()
 
 
-async def test_notification_flood_is_bounded() -> None:
-    connector = SimulatedConnector(responder=lambda data: data)
-    link = make_link(connector)
+async def test_notification_flood_fails_the_request_instead_of_losing_frames() -> None:
+    connector = SimulatedConnector(keepalive_forever=True, keepalive_interval=0.0)
+    link = make_link(connector, silence_timeout=5.0)
     link._events = asyncio.Queue(maxsize=4)
-    await ask(link)
-    for _ in range(100):
-        connector.last.send_frame(0x82, b"\x01")
-    assert link._events.qsize() == 4
-    await link.close()
+    with pytest.raises(LinkError, match="flooded"):
+        async with asyncio.timeout(2.0):
+            await ask(link)
+    assert not link.connected
+
+
+async def test_endless_keepalives_hit_the_request_deadline() -> None:
+    connector = SimulatedConnector(keepalive_forever=True, keepalive_interval=0.02)
+    link = make_link(connector, request_timeout=0.3)
+    with pytest.raises(LinkError, match="did not finish"):
+        async with asyncio.timeout(3.0):
+            await ask(link, connect_timeout=0.5)
+    assert not link.connected
+    assert not connector.last.connected
+
+
+async def test_unacknowledged_cancel_retires_the_link() -> None:
+    connector = SimulatedConnector(silent=True)
+    link = make_link(connector, silence_timeout=5.0)
+    cancelled = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.05, cancelled.set)
+    assert await ask(link, cancelled=cancelled) == MsgResponse(bytes([CTAP2_ERR_KEEPALIVE_CANCEL]))
+    assert not link.connected
+
+
+async def test_stuck_gatt_write_times_out() -> None:
+    link = make_link(SimulatedConnector(hang_writes=True), silence_timeout=0.2)
+    with pytest.raises(LinkError, match="writing"):
+        async with asyncio.timeout(2.0):
+            await ask(link)
+    assert not link.connected
 
 
 async def test_garbage_notifications_fail_the_request() -> None:

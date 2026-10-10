@@ -20,11 +20,19 @@ def test_full_config() -> None:
             "address": ADDRESS,
             "adapter": "hci1",
             "connect_timeout": 15,
+            "request_timeout": 90,
             "idle_disconnect": 0,
             "device_name": "My key",
         }
     )
-    assert config == Config(ADDRESS, "hci1", 15.0, 0.0, "My key")
+    assert config == Config(
+        address=ADDRESS,
+        adapter="hci1",
+        connect_timeout=15.0,
+        request_timeout=90.0,
+        idle_disconnect=0.0,
+        device_name="My key",
+    )
 
 
 @pytest.mark.parametrize(
@@ -39,6 +47,7 @@ def test_full_config() -> None:
         ({"address": ADDRESS, "connect_timeout": "10"}, "connect_timeout"),
         ({"address": ADDRESS, "connect_timeout": 0.5}, "between"),
         ({"address": ADDRESS, "idle_disconnect": 601}, "between"),
+        ({"address": ADDRESS, "request_timeout": 1}, "between"),
         ({"address": ADDRESS, "device_name": ""}, "device_name"),
         ({"address": ADDRESS, "device_name": "x" * 128}, "device_name"),
     ],

@@ -22,6 +22,7 @@ class Config:
     address: str
     adapter: str | None = None
     connect_timeout: float = 10.0
+    request_timeout: float = 60.0
     idle_disconnect: float = 10.0
     device_name: str = "FIDO2 BLE bridge"
 
@@ -56,6 +57,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
         address=address.upper(),
         adapter=adapter,
         connect_timeout=_number(raw, "connect_timeout", Config.connect_timeout, 1, 120),
+        request_timeout=_number(raw, "request_timeout", Config.request_timeout, 5, 300),
         idle_disconnect=_number(raw, "idle_disconnect", Config.idle_disconnect, 0, 600),
         device_name=device_name,
     )

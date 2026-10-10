@@ -168,6 +168,7 @@ the sensor. If the key does not appear in time, you get the password prompt.
 | `address` | (required) | Bluetooth address of the bonded key |
 | `adapter` | system default | Bluetooth adapter, e.g. `hci1` |
 | `connect_timeout` | `10` | Seconds a request waits for the key to connect (1 to 120) |
+| `request_timeout` | `60` | Further seconds one request may take, fingerprint wait included (5 to 300) |
 | `idle_disconnect` | `10` | Seconds the link stays open after the last request (0 to 600) |
 | `device_name` | `FIDO2 BLE bridge` | Name of the virtual HID device |
 

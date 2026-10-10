@@ -11,6 +11,10 @@ address = "AA:BB:CC:DD:EE:FF"
 # password. Lower it if you often log in without the key nearby.
 connect_timeout = 10
 
+# Hard limit, in seconds after the key connects, for one request including the fingerprint
+# wait. Stops a misbehaving key or Bluetooth stack from hanging a login prompt.
+request_timeout = 60
+
 # Seconds the Bluetooth link stays open after the last request, so the several requests of
 # one login share a connection. The key may disconnect sooner on its own to save battery.
 idle_disconnect = 10

@@ -7,6 +7,8 @@ device that spoofs the address without the key cannot complete the connection.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from collections.abc import Callable
 from typing import Any
@@ -143,7 +145,9 @@ class BleakGattConnector:
             check_bond(await read_device_properties(device_path), self._address)
             return BleakGattSession(client)
         except BaseException:
-            await client.disconnect()
+            with contextlib.suppress(Exception):
+                async with asyncio.timeout(5):
+                    await client.disconnect()
             raise
 
 

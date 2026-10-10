@@ -109,6 +109,7 @@ class FidoBleLink:
         connector: GattConnector,
         *,
         idle_disconnect: float = 10.0,
+        request_timeout: float = 60.0,
         handshake_timeout: float = 5.0,
         silence_timeout: float = 5.0,
         cancel_grace: float = 3.0,
@@ -116,6 +117,7 @@ class FidoBleLink:
     ) -> None:
         self._connector = connector
         self._idle_disconnect = idle_disconnect
+        self._request_timeout = request_timeout
         self._handshake_timeout = handshake_timeout
         self._silence_timeout = silence_timeout
         self._cancel_grace = cancel_grace
@@ -143,10 +145,19 @@ class FidoBleLink:
         on_keepalive: Callable[[int], None],
         cancelled: asyncio.Event,
     ) -> Response:
+        # A hard deadline on top of the per-step timeouts: an authenticator (or BLE stack) that
+        # keeps sending keepalives must not hold a login prompt forever.
+        deadline = connect_timeout + self._request_timeout
         async with self._lock:
             self._stop_idle_timer()
             try:
-                return await self._request_locked(payload, connect_timeout, on_keepalive, cancelled)
+                async with asyncio.timeout(deadline):
+                    return await self._request_locked(
+                        payload, connect_timeout, on_keepalive, cancelled
+                    )
+            except TimeoutError as exc:
+                await self._drop_session("request deadline exceeded")
+                raise LinkError(f"request did not finish within {deadline:g}s") from exc
             finally:
                 self._start_idle_timer()
 
@@ -250,7 +261,8 @@ class FidoBleLink:
         self._assembler.reset()
         try:
             for piece in fragment_frame(BleCmd.MSG, payload, self._fragment_size):
-                await session.write_control_point(piece)
+                async with asyncio.timeout(self._silence_timeout):
+                    await session.write_control_point(piece)
         except Exception as exc:
             await self._drop_session("write failed")
             raise LinkError(f"writing to the authenticator failed: {exc!r}") from exc
@@ -273,6 +285,9 @@ class FidoBleLink:
                 continue
             if event is None:
                 if cancel_sent:
+                    # BLE frames carry no request ID: a reply arriving later would be read as
+                    # the answer to the next request, so this link cannot be reused.
+                    await self._drop_session("cancel not acknowledged")
                     return MsgResponse(bytes([CTAP2_ERR_KEEPALIVE_CANCEL]))
                 await self._drop_session("authenticator went silent")
                 raise LinkError("authenticator stopped responding")
@@ -317,9 +332,10 @@ class FidoBleLink:
 
     async def _send_cancel(self, session: GattSession) -> None:
         try:
-            await session.write_control_point(
-                fragment_frame(BleCmd.CANCEL, b"", self._fragment_size)[0]
-            )
+            async with asyncio.timeout(self._silence_timeout):
+                await session.write_control_point(
+                    fragment_frame(BleCmd.CANCEL, b"", self._fragment_size)[0]
+                )
         except Exception as exc:
             log.warning("sending CANCEL to the authenticator failed: %r", exc)
 
@@ -346,7 +362,9 @@ class FidoBleLink:
         try:
             self._events.put_nowait(event)
         except asyncio.QueueFull:
-            log.warning("dropping BLE event: authenticator is flooding notifications")
+            # Dropping one event could lose the final response; fail the request instead.
+            self._drain()
+            self._events.put_nowait(LinkError("authenticator flooded the link with notifications"))
 
     def _drain(self) -> None:
         while not self._events.empty():
