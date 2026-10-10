@@ -1,8 +1,8 @@
 """BlueZ (via bleak) implementation of the GATT protocols in ble_link.
 
 Every connection is gated on BlueZ reporting the configured address as paired and bonded. For a
-bonded device BlueZ raises the link to encryption with the stored LTK as it connects, so a
-device that spoofs the address without the key cannot complete the connection.
+device with an LE bond BlueZ raises the link to encryption with the stored LTK as it connects,
+so a device that spoofs the address without that key cannot complete the connection.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from bleak import BleakClient, BleakScanner
@@ -36,36 +37,61 @@ log = logging.getLogger(__name__)
 
 BLUEZ_SERVICE = "org.bluez"
 DEVICE_INTERFACE = "org.bluez.Device1"
+LE_BEARER_INTERFACE = "org.bluez.Bearer.LE1"
 
 
-def check_bond(props: dict[str, Any], address: str) -> None:
-    """Refuse anything that is not the configured, bonded device."""
+@dataclass(frozen=True)
+class BondState:
+    device: dict[str, Any]
+    le_bearer: dict[str, Any] | None
+    """org.bluez.Bearer.LE1 properties; only newer BlueZ (2025+, experimental) exposes them."""
+
+
+def check_bond(state: BondState, address: str) -> None:
+    """Refuse anything that is not the configured device with a stored LE bond.
+
+    Device1.Paired/Bonded also count a BR/EDR-only bond, and BlueZ only forces encryption on LE
+    connections when the bond is an LE one. Where BlueZ reports the LE bearer separately, that
+    is checked too; otherwise the device-level flags are all there is to go on.
+    """
+    props = state.device
     if str(props.get("Address", "")).upper() != address:
         raise KeyNotTrusted(f"BlueZ device reports address {props.get('Address')!r}")
     if not props.get("Paired") or not props.get("Bonded"):
         raise KeyNotTrusted(
             f"{address} is not bonded with this host; pair and trust it with bluetoothctl"
         )
+    le = state.le_bearer
+    if le is not None and (not le.get("Paired") or not le.get("Bonded")):
+        raise KeyNotTrusted(f"{address} is bonded over classic Bluetooth only, not over LE")
 
 
-async def read_device_properties(device_path: str) -> dict[str, Any]:
+async def _get_all(bus: MessageBus, path: str, interface: str) -> dict[str, Any] | None:
+    reply = await bus.call(
+        Message(
+            destination=BLUEZ_SERVICE,
+            path=path,
+            interface="org.freedesktop.DBus.Properties",
+            member="GetAll",
+            signature="s",
+            body=[interface],
+        )
+    )
+    if reply is None or reply.message_type == MessageType.ERROR:
+        return None
+    return {name: variant.value for name, variant in reply.body[0].items()}
+
+
+async def read_bond_state(device_path: str) -> BondState:
     bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
     try:
-        reply = await bus.call(
-            Message(
-                destination=BLUEZ_SERVICE,
-                path=device_path,
-                interface="org.freedesktop.DBus.Properties",
-                member="GetAll",
-                signature="s",
-                body=[DEVICE_INTERFACE],
-            )
-        )
+        device = await _get_all(bus, device_path, DEVICE_INTERFACE)
+        le_bearer = await _get_all(bus, device_path, LE_BEARER_INTERFACE)
     finally:
         bus.disconnect()
-    if reply is None or reply.message_type == MessageType.ERROR:
+    if device is None:
         raise KeyNotTrusted(f"BlueZ has no device object at {device_path}")
-    return {name: variant.value for name, variant in reply.body[0].items()}
+    return BondState(device, le_bearer)
 
 
 def _required(service: BleakGATTService, uuid: str) -> BleakGATTCharacteristic:
@@ -130,7 +156,7 @@ class BleakGattConnector:
         if device is None:
             raise KeyNotReachable(f"{self._address} did not advertise within {timeout:g}s")
         device_path = device.details["path"]
-        check_bond(await read_device_properties(device_path), self._address)
+        check_bond(await read_bond_state(device_path), self._address)
 
         client = BleakClient(
             device,
@@ -142,7 +168,7 @@ class BleakGattConnector:
         await client.connect()
         try:
             # Re-read after connecting: pairing state can change between scan and connect.
-            check_bond(await read_device_properties(device_path), self._address)
+            check_bond(await read_bond_state(device_path), self._address)
             return BleakGattSession(client)
         except BaseException:
             with contextlib.suppress(Exception):

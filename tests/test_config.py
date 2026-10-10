@@ -4,7 +4,7 @@ from typing import Any
 import pytest
 
 from fido2_ble_bridge.ble_link import KeyNotTrusted
-from fido2_ble_bridge.bluez import check_bond
+from fido2_ble_bridge.bluez import BondState, check_bond
 from fido2_ble_bridge.config import Config, ConfigError, load_config, parse_config
 
 ADDRESS = "AA:BB:CC:DD:EE:FF"
@@ -70,7 +70,9 @@ def test_load_config_reports_unreadable_and_invalid_files(tmp_path: Path) -> Non
 
 
 def test_bond_check_accepts_only_the_configured_bonded_device() -> None:
-    check_bond({"Address": ADDRESS, "Paired": True, "Bonded": True}, ADDRESS)
+    bonded = {"Address": ADDRESS, "Paired": True, "Bonded": True}
+    check_bond(BondState(bonded, None), ADDRESS)
+    check_bond(BondState(bonded, {"Paired": True, "Bonded": True}), ADDRESS)
     for props in (
         {"Address": ADDRESS, "Paired": True, "Bonded": False},
         {"Address": ADDRESS, "Paired": False, "Bonded": True},
@@ -78,4 +80,10 @@ def test_bond_check_accepts_only_the_configured_bonded_device() -> None:
         {"Address": "11:22:33:44:55:66", "Paired": True, "Bonded": True},
     ):
         with pytest.raises(KeyNotTrusted):
-            check_bond(props, ADDRESS)
+            check_bond(BondState(props, None), ADDRESS)
+
+
+def test_bond_check_refuses_a_classic_only_bond_when_bluez_reports_bearers() -> None:
+    bonded = {"Address": ADDRESS, "Paired": True, "Bonded": True}
+    with pytest.raises(KeyNotTrusted, match="classic"):
+        check_bond(BondState(bonded, {"Paired": False, "Bonded": False}), ADDRESS)
