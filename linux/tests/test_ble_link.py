@@ -282,6 +282,24 @@ async def test_stuck_gatt_write_times_out() -> None:
     assert not link.connected
 
 
+async def test_hung_disconnect_after_a_failed_handshake_is_bounded() -> None:
+    connector = SimulatedConnector(revision=None, hang_disconnect=True)
+    link = FidoBleLink(connector, disconnect_timeout=0.1)
+    with pytest.raises(KeyUnsupported):
+        async with asyncio.timeout(1.0):
+            await ask(link, connect_timeout=5.0)
+    assert not link.connected
+
+
+async def test_hung_disconnect_of_a_dropped_link_is_bounded() -> None:
+    connector = SimulatedConnector(silent=True, hang_disconnect=True)
+    link = FidoBleLink(connector, silence_timeout=0.2, disconnect_timeout=0.1)
+    with pytest.raises(LinkError, match="stopped responding"):
+        async with asyncio.timeout(1.0):
+            await ask(link)
+    assert not link.connected
+
+
 async def test_garbage_notifications_fail_the_request() -> None:
     connector = SimulatedConnector(silent=True)
     link = make_link(connector, silence_timeout=5.0)
@@ -341,3 +359,126 @@ async def test_absent_key_fails_fast_for_a_moment_then_is_retried() -> None:
     with pytest.raises(KeyNotReachable):
         await ask(link, connect_timeout=0.2)
     assert connector.connect_calls == 2
+
+
+# A request reaches the key at most once (security review L4).
+
+# authenticatorClientPIN (abbreviated): executed twice, a PIN change would burn a PIN retry.
+CLIENT_PIN = bytes([0x06, 0xA2, 0x01, 0x02, 0x02, 0x04])
+
+
+def deliveries(connector: SimulatedConnector, payload: bytes) -> int:
+    return sum(session.received.count(payload) for session in connector.sessions)
+
+
+async def test_a_request_whose_write_response_was_lost_is_not_sent_again() -> None:
+    connector = SimulatedConnector()
+    link = make_link(connector)
+    await ask(link)  # the link is now kept open for reuse
+    key = connector.last
+    key.lose_write_response = key.write_attempts + 1  # delivered, but the writer sees an error
+    with pytest.raises(LinkError, match="writing"):
+        await ask(link, CLIENT_PIN)
+    assert deliveries(connector, CLIENT_PIN) == 1
+    assert len(connector.sessions) == 1
+
+
+async def test_a_request_is_not_sent_again_after_part_of_it_was_acknowledged() -> None:
+    connector = SimulatedConnector(control_point_length=(20).to_bytes(2, "big"), mtu=23)
+    link = make_link(connector)
+    await ask(link)
+    key = connector.last
+    key.fail_write = key.write_attempts + 2  # the 1st fragment is acknowledged, the 2nd fails
+    with pytest.raises(LinkError, match="writing"):
+        await ask(link, CLIENT_PIN + bytes(55))
+    assert len(connector.sessions) == 1
+
+
+async def test_get_info_is_sent_again_on_a_new_link_when_none_of_it_was_acknowledged() -> None:
+    # The stale-link case the re-send exists for; getInfo changes nothing on the key.
+    connector = SimulatedConnector()
+    link = make_link(connector)
+    await ask(link)
+    key = connector.last
+    key.lose_write_response = key.write_attempts + 1
+    assert isinstance(await ask(link), MsgResponse)
+    assert len(connector.sessions) == 2
+    assert deliveries(connector, GET_INFO) == 3  # the first request, then this one twice
+    await link.close()
+
+
+async def test_get_info_on_a_fresh_link_is_never_sent_again() -> None:
+    connector = SimulatedConnector(fail_write=1)
+    with pytest.raises(LinkError, match="writing"):
+        await ask(make_link(connector))
+    assert connector.connect_calls == 1
+
+
+async def test_a_cancelled_get_info_is_not_sent_again() -> None:
+    connector = SimulatedConnector()
+    link = make_link(connector)
+    await ask(link)
+    key = connector.last
+    cancelled = asyncio.Event()
+
+    async def cancel_then_fail(_fragment: bytes) -> None:
+        cancelled.set()
+        raise OSError("ATT write on a closed link")
+
+    key.write_control_point = cancel_then_fail  # type: ignore[method-assign,assignment]
+    response = await ask(link, cancelled=cancelled)
+    assert response == MsgResponse(bytes([CTAP2_ERR_KEEPALIVE_CANCEL]))
+    assert len(connector.sessions) == 1
+
+
+async def test_after_an_idle_spell_a_ping_proves_the_link_before_a_request() -> None:
+    connector = SimulatedConnector()
+    link = FidoBleLink(connector, ping_after_idle=0.05, ping_timeout=0.5, silence_timeout=0.5)
+    await ask(link)
+    for _ in range(2):
+        await asyncio.sleep(0.1)
+        assert isinstance(await ask(link, assertion_request()), MsgResponse)
+    key = connector.last
+    assert len(connector.sessions) == 1
+    assert [len(ping) for ping in key.pings] == [8, 8]
+    assert key.pings[0] != key.pings[1]  # random, so a late echo cannot pass for a new one
+    assert key.received == [GET_INFO, assertion_request(), assertion_request()]
+    await link.close()
+
+
+async def test_a_link_that_does_not_answer_the_ping_is_replaced_before_the_request() -> None:
+    connector = SimulatedConnector()
+    link = FidoBleLink(connector, ping_after_idle=0.05, ping_timeout=0.2, silence_timeout=0.5)
+    await ask(link)
+    connector.last.answer_ping = False
+    await asyncio.sleep(0.1)
+    assert isinstance(await ask(link, CLIENT_PIN), MsgResponse)
+    first, second = connector.sessions
+    assert first.received == [GET_INFO]
+    assert not first.connected
+    assert second.received == [CLIENT_PIN]
+    assert second.pings == []  # a fresh link needs no ping
+    await link.close()
+
+
+async def test_a_dead_idle_link_is_found_by_the_ping_not_by_the_request() -> None:
+    connector = SimulatedConnector()
+    link = FidoBleLink(connector, ping_after_idle=0.05, ping_timeout=0.2, silence_timeout=0.5)
+    await ask(link)
+    connector.last.connected = False  # died without BlueZ telling us yet
+    await asyncio.sleep(0.1)
+    assert isinstance(await ask(link, CLIENT_PIN), MsgResponse)
+    assert deliveries(connector, CLIENT_PIN) == 1
+    assert len(connector.sessions) == 2
+    await link.close()
+
+
+async def test_no_ping_for_get_info_or_a_link_in_use() -> None:
+    connector = SimulatedConnector()
+    link = FidoBleLink(connector, ping_after_idle=0.05, silence_timeout=0.5)
+    await ask(link)
+    await asyncio.sleep(0.1)
+    await ask(link)  # getInfo: no ping, it may simply go again on a stale link
+    await ask(link, assertion_request())  # right after a response: the link is in use
+    assert connector.last.pings == []
+    await link.close()

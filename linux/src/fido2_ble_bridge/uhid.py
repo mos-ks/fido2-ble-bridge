@@ -34,6 +34,11 @@ _UNION_SIZE = -(-(_CREATE2_HEADER.size - 4 + HID_MAX_DESCRIPTOR_SIZE) // 8) * 8
 EVENT_SIZE = 4 + _UNION_SIZE
 
 BUS_USB = 0x03
+# The bridge's HID "phys" (HID_PHYS in the device's uevent). Together with the USB bus and the
+# configured name it tells the bridge's device apart: BlueZ's own uhid devices (BLE keyboards and
+# the like, HID over GATT) are on the Bluetooth bus with the adapter's address as phys, and only
+# root can create uhid devices at all.
+BRIDGE_PHYS = "fido2-ble-bridge"
 
 # CTAP 2.1 section 11.2.8.2: usage page 0xF1D0, usage 0x01, 64-byte input and output reports.
 FIDO_REPORT_DESCRIPTOR = bytes(

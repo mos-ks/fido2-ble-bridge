@@ -1,6 +1,7 @@
 # fido2-ble-bridge configuration (/etc/fido2-ble-bridge/config.toml)
 
-# Bluetooth address of your bonded key, as shown by `bluetoothctl devices`.
+# Bluetooth address of your bonded key. `sudo fido2-ble-bridge setup` pairs the key and fills
+# this in; by hand, take it from `bluetoothctl devices`.
 # The bridge refuses to talk to anything else, and to this address unless BlueZ has a bond.
 address = "AA:BB:CC:DD:EE:FF"
 
@@ -11,8 +12,9 @@ address = "AA:BB:CC:DD:EE:FF"
 # password. Lower it if you often log in without the key nearby.
 connect_timeout = 10
 
-# Hard limit, in seconds after the key connects, for one request including the fingerprint
-# wait. Stops a misbehaving key or Bluetooth stack from hanging a login prompt.
+# Further seconds one request may take, fingerprint wait included. Together with
+# connect_timeout, counted from the start of the request, it is a hard limit that stops a
+# misbehaving key or Bluetooth stack from hanging a login prompt.
 request_timeout = 60
 
 # Seconds the Bluetooth link stays open after the last request, so the several requests of

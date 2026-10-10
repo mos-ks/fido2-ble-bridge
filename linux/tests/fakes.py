@@ -198,7 +198,11 @@ class SimulatedFidoKey:
         disconnect_mid_request: bool = False,
         keepalive_forever: bool = False,
         hang_writes: bool = False,
+        hang_disconnect: bool = False,
         ignore_cancel: bool = False,
+        answer_ping: bool = True,
+        fail_write: int | None = None,
+        lose_write_response: int | None = None,
     ) -> None:
         self.authenticator = authenticator
         self._on_disconnect = on_disconnect
@@ -212,7 +216,18 @@ class SimulatedFidoKey:
         self.disconnect_mid_request = disconnect_mid_request
         self.keepalive_forever = keepalive_forever
         self.hang_writes = hang_writes
+        self.hang_disconnect = hang_disconnect
         self.ignore_cancel = ignore_cancel
+        self.answer_ping = answer_ping
+        self.fail_write = fail_write
+        """The number of a write (counting from 1) that fails before it reaches the key."""
+        self.lose_write_response = lose_write_response
+        """The number of a write the key receives and acts on, but whose ATT write response
+        is lost: the writer sees an error."""
+        self.write_attempts = 0
+        self.pings: list[bytes] = []
+        self.received: list[bytes] = []
+        """Every complete request (MSG frame) that reached the key, in order."""
         self.connected = True
         self.selected_revision: bytes | None = None
         self.writes: list[bytes] = []
@@ -241,6 +256,8 @@ class SimulatedFidoKey:
         self._notify = callback
 
     async def disconnect(self) -> None:
+        if self.hang_disconnect:
+            await asyncio.Event().wait()
         self.connected = False
         if self._task is not None:
             self._task.cancel()
@@ -253,10 +270,13 @@ class SimulatedFidoKey:
         self._on_disconnect()
 
     async def write_control_point(self, fragment: bytes) -> None:
+        self.write_attempts += 1
         if not self.connected:
             raise OSError("ATT write on a closed link")
         if self.hang_writes:
             await asyncio.Event().wait()
+        if self.write_attempts == self.fail_write:
+            raise OSError("le-connection-abort-by-local")
         limit = min(int.from_bytes(self.control_point_length, "big"), self.fragment_limit)
         assert len(fragment) <= limit, f"fragment of {len(fragment)} bytes exceeds {limit}"
         self.writes.append(fragment)
@@ -275,6 +295,8 @@ class SimulatedFidoKey:
             cmd, data = self._rx_cmd, bytes(self._rx[: self._rx_len])
             self._rx_cmd = None
             self._dispatch(cmd, data)
+        if self.write_attempts == self.lose_write_response:
+            raise OSError("ATT write response lost: link dropped after delivery")
 
     def _dispatch(self, cmd: int, data: bytes) -> None:
         if cmd == 0xBE:
@@ -286,9 +308,12 @@ class SimulatedFidoKey:
                 self.send_frame(0x83, bytes([CTAP2_ERR_KEEPALIVE_CANCEL]))
             return
         if cmd == 0x81:
-            self.send_frame(0x81, data)
+            self.pings.append(data)
+            if self.answer_ping:
+                self.send_frame(0x81, data)
             return
         assert cmd == 0x83, f"unexpected command 0x{cmd:02x}"
+        self.received.append(data)
         self._task = asyncio.create_task(self._process(data))
 
     async def _process(self, data: bytes) -> None:

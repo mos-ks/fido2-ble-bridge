@@ -10,9 +10,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 from bleak import BleakClient, BleakScanner
 from bleak.args.bluez import BlueZClientArgs, BlueZScannerArgs
@@ -47,6 +47,10 @@ class BondState:
     """org.bluez.Bearer.LE1 properties; only newer BlueZ (2025+, experimental) exposes them."""
 
 
+def _paired_and_bonded(props: Mapping[str, Any]) -> bool:
+    return bool(props.get("Paired")) and bool(props.get("Bonded"))
+
+
 def check_bond(state: BondState, address: str) -> None:
     """Refuse anything that is not the configured device with a stored LE bond.
 
@@ -57,12 +61,12 @@ def check_bond(state: BondState, address: str) -> None:
     props = state.device
     if str(props.get("Address", "")).upper() != address:
         raise KeyNotTrusted(f"BlueZ device reports address {props.get('Address')!r}")
-    if not props.get("Paired") or not props.get("Bonded"):
+    if not _paired_and_bonded(props):
         raise KeyNotTrusted(
             f"{address} is not bonded with this host; pair and trust it with bluetoothctl"
         )
     le = state.le_bearer
-    if le is not None and (not le.get("Paired") or not le.get("Bonded")):
+    if le is not None and not _paired_and_bonded(le):
         raise KeyNotTrusted(f"{address} is bonded over classic Bluetooth only, not over LE")
 
 
@@ -177,19 +181,37 @@ class BleakGattConnector:
             raise
 
 
-async def scan_fido_devices(
-    timeout: float, adapter: str | None = None
-) -> list[tuple[str, str | None, bool]]:
-    """Addresses, names and bond state of nearby devices advertising the FIDO service."""
+class FoundKey(NamedTuple):
+    """A device advertising the FIDO service.
+
+    `bonded` reflects the device-level Paired and Bonded flags only. check_bond, which gates
+    every connection, also requires the LE bond where BlueZ reports it. `path` is the BlueZ
+    object path of the device.
+    """
+
+    address: str
+    name: str | None
+    bonded: bool
+    path: str
+
+
+async def scan_fido_devices(timeout: float, adapter: str | None = None) -> list[FoundKey]:
+    """Nearby devices advertising the FIDO service, sorted by address."""
     found = await BleakScanner.discover(
         timeout=timeout,
         return_adv=True,
         service_uuids=[FIDO_SERVICE_UUID],
         bluez=BlueZScannerArgs(adapter=adapter) if adapter else BlueZScannerArgs(),
     )
-    results = []
+    keys = []
     for device, adv in found.values():
-        props = device.details.get("props", {}) if isinstance(device.details, dict) else {}
-        bonded = bool(props.get("Paired")) and bool(props.get("Bonded"))
-        results.append((device.address, adv.local_name or device.name, bonded))
-    return sorted(results)
+        details = device.details if isinstance(device.details, dict) else {}
+        keys.append(
+            FoundKey(
+                address=device.address,
+                name=adv.local_name or device.name,
+                bonded=_paired_and_bonded(details.get("props", {})),
+                path=str(details.get("path", "")),
+            )
+        )
+    return sorted(keys, key=lambda key: key.address)

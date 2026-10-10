@@ -1,6 +1,6 @@
 [Unit]
 Description=FIDO2 Bluetooth LE key as a virtual USB FIDO device
-Documentation=https://github.com/mos-ks/fido2-ble-bridge
+Documentation=https://github.com/mos-ks/fido2-ble-bridge/tree/main/linux
 Wants=bluetooth.service
 After=bluetooth.service systemd-modules-load.service
 ConditionPathExists=/dev/uhid
@@ -11,8 +11,9 @@ ExecStart=/opt/fido2-ble-bridge/bin/python -I -m fido2_ble_bridge run --config /
 Restart=on-failure
 RestartSec=2
 
-# Unprivileged throwaway user with no device nodes at all. systemd opens /dev/uhid (root-only
-# by default) as root and hands the service only that open file descriptor.
+# Unprivileged throwaway user whose private /dev has pseudo-devices such as /dev/null but no
+# physical devices. systemd opens /dev/uhid (root-only by default) as root and hands the
+# service only that open file descriptor.
 DynamicUser=yes
 OpenFile=/dev/uhid:uhid
 PrivateDevices=yes

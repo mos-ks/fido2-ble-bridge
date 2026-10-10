@@ -114,18 +114,18 @@ def test_output_report_payload(data: bytes, rtype: int, expected: bytes | None) 
 
 def test_read_events_is_bounded_per_call() -> None:
     reader, writer = os.pipe()
-    os.set_blocking(reader, False)
-    device = uhid.UhidDevice.__new__(uhid.UhidDevice)
-    device._fd = reader
-    device._created = False
+    # Adopting a descriptor, as with the one systemd passes in, makes it non-blocking.
+    device = uhid.UhidDevice(fd=reader)
+    assert not os.get_blocking(device.fileno())
     close_event = struct.pack("=I", uhid.UHID_CLOSE).ljust(uhid.EVENT_SIZE, b"\0")
     for _ in range(5):
         os.write(writer, close_event)
     # A pipe returns whatever is buffered, so read one event-sized chunk per call.
     assert len(device.read_events(limit=2)) == 2
     assert len(device.read_events(limit=64)) == 3
+    assert device.read_events() == []
+    device.close()
     os.close(writer)
-    os.close(reader)
 
 
 def test_inherited_fd_follows_sd_listen_fds(monkeypatch: pytest.MonkeyPatch) -> None:

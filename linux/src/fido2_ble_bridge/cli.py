@@ -1,4 +1,4 @@
-"""Command line: `run` the daemon, `scan` for keys, `check` a configured key end to end."""
+"""Command line: `run` the daemon, `scan` for keys, `check` the key, `setup` everything."""
 
 from __future__ import annotations
 
@@ -9,52 +9,36 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from .ble_link import ErrorResponse, FidoBleLink, KeyUnavailable, LinkError
-from .bluez import BleakGattConnector, scan_fido_devices
-from .config import DEFAULT_CONFIG_PATH, Config, ConfigError, load_config
-from .daemon import run
+from bleak.exc import BleakError
 
-CTAP2_GET_INFO = b"\x04"
+from .bluez import scan_fido_devices
+from .config import DEFAULT_CONFIG_PATH, Config, ConfigError, load_config, parse_address
+from .console import device_name
+from .daemon import check_key, run_daemon
 
 
 async def _scan(timeout: float, adapter: str | None) -> int:
     print(f"Scanning {timeout:g}s for devices advertising the FIDO BLE service...")
-    devices = await scan_fido_devices(timeout, adapter)
-    if not devices:
+    try:
+        keys = await scan_fido_devices(timeout, adapter)
+    except (BleakError, OSError) as exc:
+        # No adapter, adapter powered off, or no system D-Bus.
+        print(f"error: Bluetooth is not available: {exc}", file=sys.stderr)
+        return 1
+    if not keys:
         print("None found. Wake the key or put it in pairing mode, then scan again.")
         return 1
-    for address, name, bonded in devices:
-        print(f"{address}  {name or '(no name)'}  {'bonded' if bonded else 'not bonded'}")
+    for key in keys:
+        bonded = "bonded" if key.bonded else "not bonded"
+        print(f"{key.address}  {device_name(key.name)}  {bonded}")
     return 0
 
 
 async def _check(config: Config) -> int:
-    link = FidoBleLink(BleakGattConnector(config.address, config.adapter), idle_disconnect=0)
     print(f"Waiting up to {config.connect_timeout:g}s for {config.address}: wake the key now.")
-    try:
-        response = await link.request(
-            CTAP2_GET_INFO,
-            connect_timeout=config.connect_timeout,
-            on_keepalive=lambda _status: None,
-            cancelled=asyncio.Event(),
-        )
-    except (KeyUnavailable, LinkError) as exc:
-        print(f"FAIL: {exc}")
-        return 1
-    finally:
-        await link.close()
-    if isinstance(response, ErrorResponse):
-        print(f"FAIL: authenticator answered with BLE error 0x{response.code:02x}")
-        return 1
-    if not response.data or response.data[0] != 0:
-        status = f"0x{response.data[0]:02x}" if response.data else "empty"
-        print(f"FAIL: getInfo returned CTAP status {status}")
-        return 1
-    print(
-        "OK: bonded and encrypted link, FIDO2 selected, "
-        f"fragment size {link.fragment_size}, getInfo returned {len(response.data) - 1} bytes."
-    )
-    return 0
+    result = await check_key(config)
+    print(f"{'OK' if result.ok else 'FAIL'}: {result.message}")
+    return 0 if result.ok else 1
 
 
 def configure_logging(*, verbose: bool) -> None:
@@ -63,6 +47,13 @@ def configure_logging(*, verbose: bool) -> None:
     # bleak logs raw GATT reads and writes (CTAP payloads, PIN protocol data) at DEBUG.
     for library in ("bleak", "dbus_fast"):
         logging.getLogger(library).setLevel(logging.WARNING)
+
+
+def _address(text: str) -> str:
+    try:
+        return parse_address(text)
+    except ConfigError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -83,20 +74,50 @@ def main(argv: Sequence[str] | None = None) -> int:
     check_cmd = commands.add_parser("check", help="connect to the configured key and query it")
     check_cmd.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
 
+    setup_cmd = commands.add_parser(
+        "setup",
+        help="guided setup (run with sudo): pair the key, start the bridge, register the key "
+        "for your account, test it and enable it for logins",
+    )
+    setup_cmd.add_argument(
+        "--user", help="account to set up (default: the one that ran sudo; root only by name)"
+    )
+    setup_cmd.add_argument("--address", type=_address, help="the key's Bluetooth address")
+    setup_cmd.add_argument(
+        "--yes", action="store_true", help="install missing packages without asking"
+    )
+    setup_cmd.add_argument(
+        "--no-pam", action="store_true", help="do everything except enabling the key in PAM"
+    )
+
     args = parser.parse_args(argv)
     configure_logging(verbose=args.verbose)
+    if args.command == "setup":
+        # Imported here only: setup brings the pairing agent, the PAM bindings and ctypes, which
+        # the sandboxed `run` service must never load.
+        from .setup_wizard import SetupOptions, run_setup  # noqa: PLC0415
+
+        # Setup talks to the user itself; the bridge's info logs would only clutter that.
+        logging.getLogger("fido2_ble_bridge").setLevel(
+            logging.DEBUG if args.verbose else logging.WARNING
+        )
+        options = SetupOptions(
+            user=args.user, address=args.address, yes=args.yes, no_pam=args.no_pam
+        )
+        return run_setup(options)
     try:
         if args.command == "scan":
             return asyncio.run(_scan(args.timeout, args.adapter))
         config = load_config(args.config)
         if args.command == "check":
             return asyncio.run(_check(config))
-        asyncio.run(run(config))
+        asyncio.run(run_daemon(config))
         return 0
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    except PermissionError as exc:
+    except OSError as exc:
+        # /dev/uhid missing, not accessible or failing: exit non-zero so systemd restarts us.
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
