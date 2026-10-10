@@ -34,6 +34,8 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q libpam-u2f pamu2fcfg fido2-tools
+          # The runner's cloud kernel keeps uhid in the extra-modules package.
+          sudo apt-get install -y -q "linux-modules-extra-$(uname -r)"
           sudo modprobe uhid
           # No desktop seat on the runner, so grant what uaccess would grant a logged-in user.
           printf '%s\n' \
