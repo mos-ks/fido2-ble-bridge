@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Final, Protocol
@@ -35,6 +37,10 @@ SERVICE_REVISION_BITFIELD_UUID = "f1d0fff4-deaa-ecee-b42f-c9ba7ed623bb"
 REVISION_FIDO2 = 0x20
 
 CTAP2_ERR_KEEPALIVE_CANCEL = 0x2D
+# authenticatorGetInfo: changes nothing on the key and needs no user, so it is the one request
+# that may be sent twice.
+CTAP2_GET_INFO = b"\x04"
+PING_NONCE_SIZE = 8
 
 
 class KeyUnavailable(Exception):
@@ -55,6 +61,13 @@ class KeyUnsupported(KeyUnavailable):
 
 class LinkError(Exception):
     """The BLE link failed while a request was in flight."""
+
+
+class _WriteFailed(LinkError):
+    def __init__(self, message: str, acknowledged: int) -> None:
+        super().__init__(message)
+        self.acknowledged = acknowledged
+        """Fragments the key acknowledged (ATT write responses) before the write failed."""
 
 
 class GattSession(Protocol):
@@ -114,6 +127,9 @@ class FidoBleLink:
         handshake_timeout: float = 5.0,
         silence_timeout: float = 5.0,
         cancel_grace: float = 3.0,
+        disconnect_timeout: float = 5.0,
+        ping_after_idle: float = 1.0,
+        ping_timeout: float = 1.0,
         queue_limit: int = 256,
     ) -> None:
         self._connector = connector
@@ -124,6 +140,10 @@ class FidoBleLink:
         self._handshake_timeout = handshake_timeout
         self._silence_timeout = silence_timeout
         self._cancel_grace = cancel_grace
+        self._disconnect_timeout = disconnect_timeout
+        self._ping_after_idle = ping_after_idle
+        self._ping_timeout = ping_timeout
+        self._last_traffic = 0.0
         self._session: GattSession | None = None
         self._generation = 0
         self._fragment_size = MIN_FRAGMENT
@@ -176,24 +196,71 @@ class FidoBleLink:
         on_keepalive: Callable[[int], None],
         cancelled: asyncio.Event,
     ) -> Response:
+        # Authenticators may power down a couple of seconds after a response, so a link kept
+        # open for reuse can be dead before its disconnect signal arrives. A request is never
+        # simply sent again on a new link, though: the key may have received and acted on it
+        # (a PIN change that then fails and burns a PIN retry, a second fingerprint prompt), and
+        # a lost ATT write response cannot tell that apart from a dead link.
+        cancelled_response = MsgResponse(bytes([CTAP2_ERR_KEEPALIVE_CANCEL]))
         reused = self._session is not None
         session = await self._session_or_cancel(connect_timeout, cancelled)
         if session is None or cancelled.is_set():
             # Cancelled while queued or connecting: the key never sees the request.
-            return MsgResponse(bytes([CTAP2_ERR_KEEPALIVE_CANCEL]))
+            return cancelled_response
+        get_info = payload[:1] == CTAP2_GET_INFO
+        idle = time.monotonic() - self._last_traffic
+        # So anything but getInfo on a kept-open link that sat idle goes only after a PING,
+        # which changes nothing on the key, proved the link alive.
+        if (
+            reused
+            and not get_info
+            and idle > self._ping_after_idle
+            and not await self._ping(session)
+        ):
+            log.info("kept-open BLE link did not answer a PING, reconnecting")
+            reused = False
+            session = await self._session_or_cancel(connect_timeout, cancelled)
+            if session is None:
+                return cancelled_response
+        if cancelled.is_set():
+            # Cancelled during the PING or the reconnect: the key never sees the request.
+            return cancelled_response
         try:
             await self._send(session, payload)
-        except LinkError:
-            # Authenticators may power down a couple of seconds after a response; a link kept
-            # open for reuse can be dead before its disconnect signal arrives.
-            if not reused:
+        except _WriteFailed as exc:
+            # getInfo alone may go again, and only when the key acknowledged none of it on a
+            # kept-open link: the stale-link case, where repeating it costs nothing.
+            if not (reused and get_info and exc.acknowledged == 0):
                 raise
+            if cancelled.is_set():
+                return cancelled_response
             log.info("kept-open BLE link was stale, reconnecting")
             session = await self._session_or_cancel(connect_timeout, cancelled)
             if session is None or cancelled.is_set():
-                return MsgResponse(bytes([CTAP2_ERR_KEEPALIVE_CANCEL]))
+                return cancelled_response
             await self._send(session, payload)
         return await self._receive(session, on_keepalive, cancelled)
+
+    async def _ping(self, session: GattSession) -> bool:
+        """Whether the key echoes a PING with a fresh random payload within ping_timeout (a stray
+        or late echo cannot pass for it). Drops the link if not."""
+        nonce = secrets.token_bytes(PING_NONCE_SIZE)
+        try:
+            await self._send(session, nonce, BleCmd.PING)
+        except LinkError:
+            return False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._ping_timeout
+        while True:
+            event = await self._next_event(None, max(0.0, deadline - loop.time()))
+            if not isinstance(event, Frame) or event.cmd not in (BleCmd.PING, BleCmd.KEEPALIVE):
+                break
+            if event.cmd == BleCmd.PING:
+                if event.data == nonce:
+                    return True
+                break
+        await self._drop_session("no answer to PING")
+        return False
 
     async def _session_or_cancel(
         self, timeout: float, cancelled: asyncio.Event
@@ -242,12 +309,12 @@ class FidoBleLink:
             async with asyncio.timeout(self._handshake_timeout):
                 await self._handshake(session, generation)
         except BaseException as exc:
-            with contextlib.suppress(Exception):
-                await session.disconnect()
+            await self._disconnect_quietly(session)
             if isinstance(exc, KeyUnavailable | LinkError) or not isinstance(exc, Exception):
                 raise
             raise LinkError(f"FIDO service handshake failed: {exc!r}") from exc
         self._session = session
+        self._last_traffic = time.monotonic()
         return session
 
     async def _handshake(self, session: GattSession, generation: int) -> None:
@@ -269,16 +336,21 @@ class FidoBleLink:
         )
         log.info("BLE link ready, fragment size %d", self._fragment_size)
 
-    async def _send(self, session: GattSession, payload: bytes) -> None:
+    async def _send(self, session: GattSession, payload: bytes, cmd: BleCmd = BleCmd.MSG) -> None:
         self._drain()
         self._assembler.reset()
+        acknowledged = 0
         try:
-            for piece in fragment_frame(BleCmd.MSG, payload, self._fragment_size):
+            for piece in fragment_frame(cmd, payload, self._fragment_size):
                 async with asyncio.timeout(self._silence_timeout):
                     await session.write_control_point(piece)
+                acknowledged += 1
+                self._last_traffic = time.monotonic()
         except Exception as exc:
             await self._drop_session("write failed")
-            raise LinkError(f"writing to the authenticator failed: {exc!r}") from exc
+            raise _WriteFailed(
+                f"writing to the authenticator failed: {exc!r}", acknowledged
+            ) from exc
 
     async def _receive(
         self,
@@ -357,6 +429,7 @@ class FidoBleLink:
     def _on_notification(self, generation: int, data: bytes) -> None:
         if generation != self._generation:
             return
+        self._last_traffic = time.monotonic()
         try:
             frame = self._assembler.feed(data)
         except FramingError as exc:
@@ -392,8 +465,12 @@ class FidoBleLink:
         if session is None:
             return
         log.info("closing BLE link: %s", reason)
+        await self._disconnect_quietly(session)
+
+    async def _disconnect_quietly(self, session: GattSession) -> None:
+        # Bounded: a disconnect that hangs in the Bluetooth stack must not hold a login prompt.
         with contextlib.suppress(Exception):
-            async with asyncio.timeout(5):
+            async with asyncio.timeout(self._disconnect_timeout):
                 await session.disconnect()
 
     def _start_idle_timer(self) -> None:

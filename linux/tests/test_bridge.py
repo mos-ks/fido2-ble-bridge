@@ -321,8 +321,8 @@ async def test_long_responses_are_paced_for_hidraw() -> None:
     for report in fragment(cid, Cmd.CBOR, b"\x04"):
         bridge.on_output_report(report)
     await asyncio.wait_for(bridge.drain(), 5.0)
-    data = [t for t in sink.times]
-    assert len(data) >= 119
-    burst = max(sum(1 for u in data if t <= u < t + 0.002) for t in data)
+    times = sink.times
+    assert len(times) >= 119
+    burst = max(sum(1 for u in times if t <= u < t + 0.002) for t in times)
     assert burst <= 32
     await link.close()

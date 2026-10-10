@@ -2,14 +2,14 @@
 
 Only the Bluetooth radio is simulated. Needs a writable /dev/uhid, read/write access to the
 hidraw node udev creates (uaccess on a desktop seat, or a CI udev rule), fido2-token, pamu2fcfg
-and pam_u2f.so. Tool paths can be overridden with FIDO2_TOKEN, PAMU2FCFG and PAM_U2F_SO.
+and pam_u2f.so. Tool paths can be overridden with FIDO2_TOKEN, PAMU2FCFG and PAM_U2F_SO, except
+that setup's login test always uses the system's pam_u2f.so, as setup itself does.
 """
 
 from __future__ import annotations
 
 import asyncio
 import getpass
-import glob
 import hashlib
 import os
 import secrets
@@ -20,32 +20,29 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
-import pam_harness
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 from fakes import AAGUID, SimulatedConnector, SoftAuthenticator
+from pam_profile import CHECK, stack_from_profile
+from setup_fakes import ScriptedConsole
 
+from fido2_ble_bridge import pam
 from fido2_ble_bridge.ble_link import FidoBleLink
 from fido2_ble_bridge.daemon import serve_device
+from fido2_ble_bridge.setup_wizard import Host, Paths, Setup, SetupOptions, find_hidraw_node
 from fido2_ble_bridge.uhid import UhidDevice
 
 ORIGIN = "pam://fido2-ble-e2e"
 SERVICE = "fido2-ble-e2e"
+CMD_MAKE_CREDENTIAL = 0x01
 CMD_GET_ASSERTION = 0x02
 
 
 def _pam_u2f_module() -> str | None:
     if os.environ.get("PAM_U2F_SO"):
         return os.environ["PAM_U2F_SO"]
-    for pattern in (
-        "/lib/*/security/pam_u2f.so",
-        "/usr/lib/*/security/pam_u2f.so",
-        "/usr/lib/security/pam_u2f.so",
-        "/usr/lib64/security/pam_u2f.so",
-    ):
-        if found := sorted(glob.glob(pattern)):
-            return found[0]
-    return None
+    found = pam.find_pam_u2f()
+    return str(found) if found else None
 
 
 FIDO2_TOKEN = os.environ.get("FIDO2_TOKEN") or shutil.which("fido2-token")
@@ -108,10 +105,8 @@ class BridgeThread:
         )
 
     def _find_node(self) -> str | None:
-        for uevent in glob.glob("/sys/class/hidraw/hidraw*/device/uevent"):
-            if f"HID_NAME={self.name}\n" in Path(uevent).read_text():
-                return "/dev/" + Path(uevent).parent.parent.name
-        return None
+        # What setup uses too: matched by HID name, and only under the uhid device tree.
+        return find_hidraw_node(Path("/sys/class/hidraw"), self.name)
 
     def stop(self) -> None:
         if self._loop is not None and self._stop is not None:
@@ -156,9 +151,39 @@ def test_libfido2_enumerates_and_queries_the_virtual_key(
     assert AAGUID.hex() in info
 
 
+def test_setup_reads_registers_and_tests_the_key_with_the_real_tools(
+    bridge: tuple[BridgeThread, str], tmp_path: Path
+) -> None:
+    # setup's fingerprint check, registration and PAM test, run against real fido2-token,
+    # pamu2fcfg and pam_u2f (the system's module: the test stack names it as the profile does).
+    if os.environ.get("PAM_U2F_SO") and pam.find_pam_u2f() is None:
+        pytest.skip("setup's login test uses the system's pam_u2f.so; PAM_U2F_SO is not used here")
+    if PAMU2FCFG is None or pam.find_pam_u2f() is None or not pam.available():
+        pytest.skip("pamu2fcfg, the system's pam_u2f.so or pam_start_confdir not available")
+    thread, node = bridge
+    if listed_devices() != [node]:
+        pytest.skip("another FIDO device is attached; pamu2fcfg would pick the wrong one")
+    assert FIDO2_TOKEN is not None
+    user = getpass.getuser()
+    console = ScriptedConsole("")  # no backup key
+    host = Host(console=console, paths=Paths(tmp_path), euid=os.geteuid(), sudo_user=user)
+    setup = Setup(SetupOptions(user=user), host)
+    setup.user = user
+    setup.tools = {"pamu2fcfg": PAMU2FCFG, "fido2-token": FIDO2_TOKEN}
+
+    assert "uv" in setup._key_options(node)
+    assert setup.register(node, thread.name) == node
+    assert not host.paths.mappings.exists()  # saved only once the login test passed
+    assert setup.test_login(node) is True
+    assert host.paths.mappings.read_text().startswith(f"{user}:")
+    assert any(line.startswith("  pam_u2f: ") and "touch" in line.lower() for line in console.lines)
+    assert thread.authenticator.commands.count(CMD_MAKE_CREDENTIAL) == 1
+    assert console.answers == []
+
+
 @pytest.fixture
 def registered(bridge: tuple[BridgeThread, str], tmp_path: Path) -> tuple[SoftAuthenticator, Path]:
-    if PAMU2FCFG is None or PAM_U2F_SO is None or not pam_harness.available():
+    if PAMU2FCFG is None or PAM_U2F_SO is None or not pam.available():
         pytest.skip("pamu2fcfg, pam_u2f.so or pam_start_confdir not available")
     thread, node = bridge
     if listed_devices() != [node]:
@@ -173,45 +198,36 @@ def registered(bridge: tuple[BridgeThread, str], tmp_path: Path) -> tuple[SoftAu
     (confdir / SERVICE).write_text(
         f"auth required {PAM_U2F_SO} authfile={authfile} origin={ORIGIN} cue userverification=1\n"
     )
-    stack = stack_from_shipped_profile(authfile)
-    for service in ("sudo", "sshd"):
-        (confdir / service).write_text(stack)
+    # The shipped profile's stack twice: once with the local-session check saying "local"
+    # (exit 0), once saying "not local", as it does for a request from an SSH session.
+    for directory, verdict in ((confdir, "true"), (remote_confdir(confdir), "false")):
+        directory.mkdir(exist_ok=True)
+        program = shutil.which(verdict)
+        assert program is not None
+        stack = stack_from_profile(
+            {
+                "pam_u2f.so": str(PAM_U2F_SO),
+                "/etc/fido2-ble-bridge/u2f_mappings": str(authfile),
+                "pam://fido2-ble-bridge": ORIGIN,
+                CHECK: program,
+            }
+        )
+        for service in ("sudo", "sshd", "su", "polkit-1"):
+            (directory / service).write_text(stack)
     return thread.authenticator, confdir
 
 
-PROFILE = Path(__file__).resolve().parent.parent / "packaging" / "pam-configs" / "fido2-ble-bridge"
-
-
-def stack_from_shipped_profile(authfile: Path) -> str:
-    """The auth stack pam-auth-update builds from the shipped profile.
-
-    Mirrors its output on Ubuntu 24.04: the profile's Auth lines with `end` turned into a jump
-    past the Primary block, then pam_unix (here pam_deny, a password that never matches), then
-    the stock tail.
-    """
-    text = PROFILE.read_text()
-    block = text.split("\nAuth:\n", 1)[1].split("\nAuth-Initial:", 1)[0]
-    primary = [line.strip() for line in block.splitlines() if line.strip()]
-    primary.append("[success=end default=ignore] pam_deny.so")
-    lines = []
-    for index, line in enumerate(primary):
-        control, rest = line.split("]", 1)
-        control = control.replace("end", str(len(primary) - index)) + "]"
-        rest = rest.replace("pam_u2f.so", str(PAM_U2F_SO))
-        rest = rest.replace("/etc/fido2-ble-bridge/u2f_mappings", str(authfile))
-        rest = rest.replace("pam://fido2-ble-bridge", ORIGIN)
-        lines.append(f"auth {control} {rest.strip()}")
-    lines += ["auth requisite pam_deny.so", "auth required pam_permit.so"]
-    return "\n".join(lines) + "\n"
+def remote_confdir(confdir: Path) -> Path:
+    return confdir.with_name("pam.d-remote")
 
 
 def test_pam_u2f_login_with_fingerprint_succeeds(
     registered: tuple[SoftAuthenticator, Path],
 ) -> None:
     authenticator, confdir = registered
-    result, messages = pam_harness.authenticate(confdir, SERVICE, getpass.getuser())
-    assert result == pam_harness.PAM_SUCCESS
-    assert any("touch" in m.lower() for m in messages)
+    outcome = pam.authenticate(confdir, SERVICE, getpass.getuser())
+    assert outcome.code == pam.PAM_SUCCESS
+    assert any("touch" in m.lower() for m in outcome.messages)
     # pam_u2f probes silently for the credential, then asks with user verification.
     assert authenticator.commands.count(CMD_GET_ASSERTION) >= 2
 
@@ -221,8 +237,8 @@ def test_pam_u2f_login_fails_when_the_fingerprint_does_not_match(
 ) -> None:
     authenticator, confdir = registered
     authenticator.uv_succeeds = False
-    result, _ = pam_harness.authenticate(confdir, SERVICE, getpass.getuser())
-    assert result == pam_harness.PAM_AUTH_ERR
+    outcome = pam.authenticate(confdir, SERVICE, getpass.getuser())
+    assert outcome.code == pam.PAM_AUTH_ERR
 
 
 def test_pam_u2f_rejects_a_key_that_signs_with_the_wrong_private_key(
@@ -237,26 +253,39 @@ def test_pam_u2f_rejects_a_key_that_signs_with_the_wrong_private_key(
             rp_id_hash,
             ec.generate_private_key(ec.SECP256R1()),
         )
-    result, _ = pam_harness.authenticate(confdir, SERVICE, getpass.getuser())
-    assert result == pam_harness.PAM_AUTH_ERR
+    outcome = pam.authenticate(confdir, SERVICE, getpass.getuser())
+    assert outcome.code == pam.PAM_AUTH_ERR
 
 
 def test_shipped_pam_profile_uses_the_key_for_local_services(
     registered: tuple[SoftAuthenticator, Path],
 ) -> None:
     _, confdir = registered
-    result, _ = pam_harness.authenticate(confdir, "sudo", getpass.getuser())
-    assert result == pam_harness.PAM_SUCCESS
+    outcome = pam.authenticate(confdir, "sudo", getpass.getuser())
+    assert outcome.code == pam.PAM_SUCCESS
 
 
-def test_shipped_pam_profile_never_wakes_the_key_for_sshd(
-    registered: tuple[SoftAuthenticator, Path],
+@pytest.mark.parametrize("service", ["sshd", "su", "polkit-1"])
+def test_shipped_pam_profile_never_wakes_the_key_for_sshd_su_or_polkit(
+    registered: tuple[SoftAuthenticator, Path], service: str
 ) -> None:
     # A remote login attempt must not make the key ask for a fingerprint: if the owner touched
-    # it, the remote session would be the one let in.
+    # it, the remote session would be the one let in. su and polkit let the caller name the
+    # account to log in as, so anyone could make the owner's key ask.
     authenticator, confdir = registered
     before = list(authenticator.commands)
-    result, messages = pam_harness.authenticate(confdir, "sshd", getpass.getuser())
-    assert result == pam_harness.PAM_AUTH_ERR
+    outcome = pam.authenticate(confdir, service, getpass.getuser())
+    assert outcome.code == pam.PAM_AUTH_ERR
     assert authenticator.commands == before
-    assert not any("touch" in m.lower() for m in messages)
+    assert not any("touch" in m.lower() for m in outcome.messages)
+
+
+def test_shipped_pam_profile_skips_the_key_for_sudo_outside_a_local_session(
+    registered: tuple[SoftAuthenticator, Path],
+) -> None:
+    authenticator, confdir = registered
+    before = list(authenticator.commands)
+    outcome = pam.authenticate(remote_confdir(confdir), "sudo", getpass.getuser())
+    assert outcome.code == pam.PAM_AUTH_ERR
+    assert authenticator.commands == before
+    assert not any("touch" in m.lower() for m in outcome.messages)

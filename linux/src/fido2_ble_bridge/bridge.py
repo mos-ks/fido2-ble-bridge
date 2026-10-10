@@ -141,6 +141,8 @@ class Bridge:
                 log.warning("writing a HID input report failed: %s", exc)
 
     async def _forward(self, request: Request, cancelled: asyncio.Event) -> None:
+        # Until the key is connected, the user has to act (wake the key), so the client is told
+        # UPNEEDED; once connected, the key's own keepalive statuses take over.
         status = [KeepaliveStatus.PROCESSING if self._link.connected else KeepaliveStatus.UPNEEDED]
 
         def on_keepalive(code: int) -> None:
