@@ -19,6 +19,7 @@ from .uhid import (
     OutputEvent,
     SetReportEvent,
     UhidDevice,
+    inherited_fd,
     output_report_payload,
 )
 
@@ -92,7 +93,7 @@ async def run(config: Config) -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
     try:
-        with UhidDevice() as uhid:
+        with UhidDevice(fd=inherited_fd("uhid")) as uhid:
             await serve_device(
                 uhid,
                 link,

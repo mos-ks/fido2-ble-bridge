@@ -11,13 +11,11 @@ ExecStart=/opt/fido2-ble-bridge/bin/python -I -m fido2_ble_bridge run --config /
 Restart=on-failure
 RestartSec=2
 
-# Unprivileged throwaway user. /dev/uhid is group "input"; it is the only device node in the
-# private /dev, so that group grants nothing else here.
+# Unprivileged throwaway user with no device nodes at all. systemd opens /dev/uhid (root-only
+# by default) as root and hands the service only that open file descriptor.
 DynamicUser=yes
-SupplementaryGroups=input
+OpenFile=/dev/uhid:uhid
 PrivateDevices=yes
-BindPaths=/dev/uhid
-DeviceAllow=/dev/uhid rw
 
 # Talks to BlueZ over the system D-Bus socket only.
 PrivateNetwork=yes

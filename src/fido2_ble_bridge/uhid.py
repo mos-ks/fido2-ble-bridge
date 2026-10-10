@@ -154,9 +154,35 @@ def output_report_payload(event: OutputEvent, report_size: int) -> bytes | None:
     return None
 
 
+SD_LISTEN_FDS_START = 3
+
+
+def inherited_fd(name: str) -> int | None:
+    """An fd passed by systemd (OpenFile=path:name), per the sd_listen_fds protocol."""
+    if os.environ.get("LISTEN_PID") != str(os.getpid()):
+        return None
+    try:
+        count = int(os.environ.get("LISTEN_FDS", "0"))
+    except ValueError:
+        return None
+    names = os.environ.get("LISTEN_FDNAMES", "").split(":")
+    for index in range(min(count, len(names))):
+        if names[index] == name:
+            return SD_LISTEN_FDS_START + index
+    return None
+
+
 class UhidDevice:
-    def __init__(self, path: str = "/dev/uhid") -> None:
-        self._fd = os.open(path, os.O_RDWR | os.O_CLOEXEC | os.O_NONBLOCK)
+    """Opens /dev/uhid, or adopts an already-open fd (systemd opens it as root for the
+    unprivileged service, so the device node can stay root-only)."""
+
+    def __init__(self, path: str = "/dev/uhid", *, fd: int | None = None) -> None:
+        if fd is None:
+            self._fd = os.open(path, os.O_RDWR | os.O_CLOEXEC | os.O_NONBLOCK)
+        else:
+            os.set_blocking(fd, False)
+            os.set_inheritable(fd, False)
+            self._fd = fd
         self._created = False
 
     def __enter__(self) -> UhidDevice:

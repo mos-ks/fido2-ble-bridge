@@ -41,7 +41,7 @@ built-in verification no secret ever crosses the bridge.
   or a notification flood, drop the link.
 - Message contents are never logged, and `bleak`/`dbus-fast` debug output (which would include
   raw GATT payloads) stays off even with `-v`.
-- systemd sandbox: `DynamicUser`, empty capability set, `PrivateNetwork`, `PrivateDevices` with
-  only `/dev/uhid` bound in, `ProtectSystem=strict`, `MemoryDenyWriteExecute`,
-  `SystemCallFilter=@system-service`.
+- systemd sandbox: `DynamicUser`, empty capability set, `PrivateNetwork`, `PrivateDevices` (no
+  device nodes at all; systemd passes the open `/dev/uhid` descriptor via `OpenFile=`),
+  `ProtectSystem=strict`, `MemoryDenyWriteExecute`, `SystemCallFilter=@system-service`.
 - Runtime dependencies installed from binary wheels pinned by hash.

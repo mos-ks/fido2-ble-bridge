@@ -45,8 +45,10 @@ On top of that:
 - **Bounded in time.** Every request has a hard deadline (`request_timeout`), so a misbehaving
   key or Bluetooth stack cannot hang a login prompt.
 - **Sandboxed service.** It runs as a throwaway `DynamicUser` with no capabilities, no network
-  (D-Bus only), a read-only filesystem, a private `/dev` holding only `/dev/uhid`, and a
-  system-call filter. See `packaging/fido2-ble-bridge.service`.
+  (D-Bus only), a read-only filesystem, an empty private `/dev`, and a system-call filter.
+  systemd opens the root-only `/dev/uhid` and passes the service just that file descriptor
+  (`OpenFile=`), so no device permissions or groups are loosened. See
+  `packaging/fido2-ble-bridge.service`.
 - **Pinned dependencies.** The installer installs runtime dependencies (`bleak`, `dbus-fast`)
   from binary wheels only, verified against hashes from `uv.lock`.
 
@@ -70,8 +72,8 @@ systemd's standard FIDO udev rules (`60-fido-id.rules` with `uaccess`). See
 
 ## Requirements
 
-- Linux with BlueZ ≥ 5.65 (it must report `Bonded`) and the `uhid` kernel module (standard on
-  Debian 12+, Ubuntu 24.04+, Fedora, Arch)
+- Linux with BlueZ ≥ 5.65 (it must report `Bonded`), systemd ≥ 253 (for `OpenFile=`) and the
+  `uhid` kernel module: Ubuntu 24.04+, Debian 13+, current Fedora and Arch
 - Python ≥ 3.11 with `venv` (`apt install python3-venv` on Debian/Ubuntu)
 - `pam_u2f` ≥ 1.1 and libfido2 tools: `apt install libpam-u2f pamu2fcfg fido2-tools`
 - A FIDO2 key that supports the BLE transport (CTAP 2.1 section 11.4)
@@ -237,8 +239,8 @@ $ uv run pytest            # unit, link and bridge tests
 $ uv run ruff check . && uv run ruff format --check . && uv run mypy
 ```
 
-The end-to-end tests in `tests/test_e2e_uhid.py` run when `/dev/uhid` is writable (it is for
-the logged-in user on most desktops) and `fido2-token`, `pamu2fcfg` and `pam_u2f.so` are
+The end-to-end tests in `tests/test_e2e_uhid.py` run when you can write `/dev/uhid` (root-only
+by default; CI loosens it with a udev rule) and `fido2-token`, `pamu2fcfg` and `pam_u2f.so` are
 installed. Point `FIDO2_TOKEN`, `PAMU2FCFG` and `PAM_U2F_SO` at other builds if needed. They
 use `pam_start_confdir`, so they never touch `/etc/pam.d`. CI runs them on every push.
 

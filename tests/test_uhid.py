@@ -126,3 +126,16 @@ def test_read_events_is_bounded_per_call() -> None:
     assert len(device.read_events(limit=64)) == 3
     os.close(writer)
     os.close(reader)
+
+
+def test_inherited_fd_follows_sd_listen_fds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LISTEN_PID", str(os.getpid()))
+    monkeypatch.setenv("LISTEN_FDS", "2")
+    monkeypatch.setenv("LISTEN_FDNAMES", "other:uhid")
+    assert uhid.inherited_fd("uhid") == 4
+    assert uhid.inherited_fd("missing") is None
+    monkeypatch.setenv("LISTEN_PID", "1")
+    assert uhid.inherited_fd("uhid") is None
+    monkeypatch.setenv("LISTEN_PID", str(os.getpid()))
+    monkeypatch.setenv("LISTEN_FDS", "nope")
+    assert uhid.inherited_fd("uhid") is None
