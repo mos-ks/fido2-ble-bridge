@@ -1,0 +1,54 @@
+[Unit]
+Description=FIDO2 Bluetooth LE key as a virtual USB FIDO device
+Documentation=https://github.com/mos-ks/fido2-ble-bridge
+Wants=bluetooth.service
+After=bluetooth.service
+
+[Service]
+Type=exec
+ExecStart=/opt/fido2-ble-bridge/bin/python -I -m fido2_ble_bridge run --config /etc/fido2-ble-bridge/config.toml
+Restart=on-failure
+RestartSec=2
+
+# Unprivileged throwaway user. /dev/uhid is group "input"; it is the only device node in the
+# private /dev, so that group grants nothing else here.
+DynamicUser=yes
+SupplementaryGroups=input
+PrivateDevices=yes
+BindPaths=/dev/uhid
+DeviceAllow=/dev/uhid rw
+
+# Talks to BlueZ over the system D-Bus socket only.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateIPC=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

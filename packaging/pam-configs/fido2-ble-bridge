@@ -1,0 +1,8 @@
+Name: FIDO2 key over Bluetooth (pam_u2f + fido2-ble-bridge)
+Default: no
+Priority: 300
+Auth-Type: Primary
+Auth:
+	[success=end default=ignore]	pam_u2f.so authfile=/etc/fido2-ble-bridge/u2f_mappings origin=pam://fido2-ble-bridge cue userverification=1
+Auth-Initial:
+	[success=end default=ignore]	pam_u2f.so authfile=/etc/fido2-ble-bridge/u2f_mappings origin=pam://fido2-ble-bridge cue userverification=1

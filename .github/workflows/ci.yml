@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+
+      - name: End-to-end prerequisites (uhid, libfido2, pam_u2f)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libpam-u2f pamu2fcfg fido2-tools
+          sudo modprobe uhid
+          # No desktop seat on the runner, so grant what uaccess would grant a logged-in user.
+          printf '%s\n' \
+            'KERNEL=="uhid", MODE="0666"' \
+            'SUBSYSTEM=="hidraw", ENV{ID_SECURITY_TOKEN}=="1", MODE="0666"' \
+            | sudo tee /etc/udev/rules.d/99-ci-fido.rules
+          sudo udevadm control --reload-rules
+          sudo chmod 0666 /dev/uhid
+
+      - run: uv run pytest -v -rs
+
+      - name: Fail if the end-to-end tests were skipped
+        run: |
+          uv run pytest -m uhid -q -rs | tee e2e.txt
+          ! grep -q SKIPPED e2e.txt

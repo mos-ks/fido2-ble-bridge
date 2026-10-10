@@ -1,0 +1,69 @@
+[project]
+name = "fido2-ble-bridge"
+version = "0.1.0"
+description = "Use a Bluetooth LE FIDO2 security key on Linux as if it were a USB key: login, sudo and the lock screen via pam_u2f, unchanged."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "mos-ks" }]
+requires-python = ">=3.11"
+classifiers = [
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: System :: Hardware :: Hardware Drivers",
+]
+dependencies = [
+    "bleak>=3.0.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/mos-ks/fido2-ble-bridge"
+
+[project.scripts]
+fido2-ble-bridge = "fido2_ble_bridge.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "fido2>=2.2.1",
+    "mypy>=2.4.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.17.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "S", "RUF", "ASYNC", "PL"]
+ignore = [
+    "PLR2004", # protocol constants are clearer inline next to the spec table they come from
+    "PLR0911",
+    "PLR0913",
+    "ASYNC109", # bleak's scanner takes a scan duration, so timeouts are passed down as values
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S603", "S607", "PLR0915", "S311", "ASYNC110"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["fido2.*"]
+follow_untyped_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "uhid: needs a writable /dev/uhid plus libfido2 and pam_u2f binaries (end-to-end)",
+]
