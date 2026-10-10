@@ -1,8 +1,10 @@
-Name: FIDO2 key over Bluetooth (pam_u2f + fido2-ble-bridge)
+Name: FIDO2 key over Bluetooth for local logins (pam_u2f + fido2-ble-bridge)
 Default: no
 Priority: 300
 Auth-Type: Primary
 Auth:
+	[success=ignore default=1]	pam_succeed_if.so quiet service in gdm-password:sudo:sudo-i:su:su-l:login:polkit-1:sddm:kde:lightdm:xscreensaver:cinnamon-screensaver:mate-screensaver:xfce4-screensaver:swaylock:hyprlock:i3lock
 	[success=end default=ignore]	pam_u2f.so authfile=/etc/fido2-ble-bridge/u2f_mappings origin=pam://fido2-ble-bridge cue userverification=1
 Auth-Initial:
+	[success=ignore default=1]	pam_succeed_if.so quiet service in gdm-password:sudo:sudo-i:su:su-l:login:polkit-1:sddm:kde:lightdm:xscreensaver:cinnamon-screensaver:mate-screensaver:xfce4-screensaver:swaylock:hyprlock:i3lock
 	[success=end default=ignore]	pam_u2f.so authfile=/etc/fido2-ble-bridge/u2f_mappings origin=pam://fido2-ble-bridge cue userverification=1

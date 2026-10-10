@@ -173,7 +173,36 @@ def registered(bridge: tuple[BridgeThread, str], tmp_path: Path) -> tuple[SoftAu
     (confdir / SERVICE).write_text(
         f"auth required {PAM_U2F_SO} authfile={authfile} origin={ORIGIN} cue userverification=1\n"
     )
+    stack = stack_from_shipped_profile(authfile)
+    for service in ("sudo", "sshd"):
+        (confdir / service).write_text(stack)
     return thread.authenticator, confdir
+
+
+PROFILE = Path(__file__).resolve().parent.parent / "packaging" / "pam-configs" / "fido2-ble-bridge"
+
+
+def stack_from_shipped_profile(authfile: Path) -> str:
+    """The auth stack pam-auth-update builds from the shipped profile.
+
+    Mirrors its output on Ubuntu 24.04: the profile's Auth lines with `end` turned into a jump
+    past the Primary block, then pam_unix (here pam_deny, a password that never matches), then
+    the stock tail.
+    """
+    text = PROFILE.read_text()
+    block = text.split("\nAuth:\n", 1)[1].split("\nAuth-Initial:", 1)[0]
+    primary = [line.strip() for line in block.splitlines() if line.strip()]
+    primary.append("[success=end default=ignore] pam_deny.so")
+    lines = []
+    for index, line in enumerate(primary):
+        control, rest = line.split("]", 1)
+        control = control.replace("end", str(len(primary) - index)) + "]"
+        rest = rest.replace("pam_u2f.so", str(PAM_U2F_SO))
+        rest = rest.replace("/etc/fido2-ble-bridge/u2f_mappings", str(authfile))
+        rest = rest.replace("pam://fido2-ble-bridge", ORIGIN)
+        lines.append(f"auth {control} {rest.strip()}")
+    lines += ["auth requisite pam_deny.so", "auth required pam_permit.so"]
+    return "\n".join(lines) + "\n"
 
 
 def test_pam_u2f_login_with_fingerprint_succeeds(
@@ -210,3 +239,24 @@ def test_pam_u2f_rejects_a_key_that_signs_with_the_wrong_private_key(
         )
     result, _ = pam_harness.authenticate(confdir, SERVICE, getpass.getuser())
     assert result == pam_harness.PAM_AUTH_ERR
+
+
+def test_shipped_pam_profile_uses_the_key_for_local_services(
+    registered: tuple[SoftAuthenticator, Path],
+) -> None:
+    _, confdir = registered
+    result, _ = pam_harness.authenticate(confdir, "sudo", getpass.getuser())
+    assert result == pam_harness.PAM_SUCCESS
+
+
+def test_shipped_pam_profile_never_wakes_the_key_for_sshd(
+    registered: tuple[SoftAuthenticator, Path],
+) -> None:
+    # A remote login attempt must not make the key ask for a fingerprint: if the owner touched
+    # it, the remote session would be the one let in.
+    authenticator, confdir = registered
+    before = list(authenticator.commands)
+    result, messages = pam_harness.authenticate(confdir, "sshd", getpass.getuser())
+    assert result == pam_harness.PAM_AUTH_ERR
+    assert authenticator.commands == before
+    assert not any("touch" in m.lower() for m in messages)
