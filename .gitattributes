@@ -1,0 +1,16 @@
+# Text files are stored with LF in the repository and checked out with the platform's default.
+* text=auto
+
+# Files that Linux tools read stay LF in every checkout, Windows ones included: a copied
+# install.sh must run in bash, and the PAM profile must not pass a stray \r to pam_u2f.
+*.sh      text eol=lf
+*.py      text eol=lf
+*.service text eol=lf
+*.toml    text eol=lf
+*.example text eol=lf
+*.md      text eol=lf
+*.yml     text eol=lf
+*.lock    text eol=lf
+linux/packaging/pam-configs/* text eol=lf
+linux/packaging/requirements.txt text eol=lf
+linux/.python-version text eol=lf
