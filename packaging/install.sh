@@ -26,22 +26,32 @@ command -v bluetoothctl >/dev/null || die "BlueZ is missing (apt install bluez)"
 echo uhid > /etc/modules-load.d/fido2-ble-bridge.conf
 modprobe uhid
 
+# Build the new environment beside the old one, so a failed download leaves the running
+# install untouched. The service only runs `python -m`, so moving the venv afterwards is safe.
+staging="$prefix.new"
+rm -rf "$staging"
+/usr/bin/python3 -m venv "$staging"
+"$staging/bin/python" -m pip install --quiet --disable-pip-version-check --no-deps \
+  --require-hashes --only-binary=:all: -r "$here/requirements.txt"
+site="$("$staging/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+cp -r "$repo/src/fido2_ble_bridge" "$site/"
+find "$site/fido2_ble_bridge" -name __pycache__ -prune -exec rm -rf {} +
+"$staging/bin/python" -m compileall -q "$site/fido2_ble_bridge"
+chown -R root:root "$staging"
+chmod -R go-w "$staging"
+
 if systemctl is-active --quiet fido2-ble-bridge; then
   systemctl stop fido2-ble-bridge
   restart=1
 else
   restart=0
 fi
-
-/usr/bin/python3 -m venv --clear "$prefix"
-"$prefix/bin/python" -m pip install --quiet --disable-pip-version-check --no-deps \
-  --require-hashes --only-binary=:all: -r "$here/requirements.txt"
-site="$("$prefix/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-cp -r "$repo/src/fido2_ble_bridge" "$site/"
-find "$site/fido2_ble_bridge" -name __pycache__ -prune -exec rm -rf {} +
-"$prefix/bin/python" -m compileall -q "$site/fido2_ble_bridge"
-chown -R root:root "$prefix"
-chmod -R go-w "$prefix"
+rm -rf "$prefix.old"
+if [[ -e $prefix ]]; then
+  mv "$prefix" "$prefix.old"
+fi
+mv "$staging" "$prefix"
+rm -rf "$prefix.old"
 
 printf '#!/bin/sh\nexec %s/bin/python -I -m fido2_ble_bridge "$@"\n' "$prefix" > "$launcher"
 chmod 0755 "$launcher"
@@ -51,7 +61,9 @@ if [[ ! -e $config_dir/config.toml ]]; then
   install -m 0644 "$here/config.toml.example" "$config_dir/config.toml"
 fi
 install -m 0644 "$here/fido2-ble-bridge.service" "$unit_path"
-install -m 0644 "$here/pam-configs/fido2-ble-bridge" "$pam_profile"
+if [[ -d /usr/share/pam-configs ]]; then
+  install -m 0644 "$here/pam-configs/fido2-ble-bridge" "$pam_profile"
+fi
 systemctl daemon-reload
 
 if grep -q "$placeholder" "$config_dir/config.toml"; then

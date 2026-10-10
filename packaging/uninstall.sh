@@ -6,8 +6,13 @@ set -euo pipefail
 [[ $EUID -eq 0 ]] || { echo "error: run as root: sudo $0" >&2; exit 1; }
 
 if [[ -e /usr/share/pam-configs/fido2-ble-bridge ]]; then
-  pam-auth-update --package --remove fido2-ble-bridge
+  if command -v pam-auth-update >/dev/null; then
+    pam-auth-update --package --remove fido2-ble-bridge
+  fi
   rm -f /usr/share/pam-configs/fido2-ble-bridge
+fi
+if grep -rqs 'fido2-ble-bridge' /etc/pam.d; then
+  echo "warning: /etc/pam.d still mentions fido2-ble-bridge; remove those lines by hand" >&2
 fi
 systemctl disable --now fido2-ble-bridge 2>/dev/null || true
 rm -f /etc/systemd/system/fido2-ble-bridge.service
