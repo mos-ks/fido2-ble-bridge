@@ -25,28 +25,48 @@ the right credential with the wrong private key is refused by the real `pam_u2f`
 On top of that:
 
 - **Pinned, bonded key only.** The bridge connects only to the address in its config, and only
-  if BlueZ reports it as paired *and* bonded. For bonded devices BlueZ requires link encryption
-  with the stored long-term key as it connects (checked in BlueZ's `device.c`), so a device
-  copying your key's address without that key cannot complete a connection. This is what
-  CTAP 2.1 section 11.4 requires of BLE clients.
+  if BlueZ reports it as paired *and* bonded. For a device bonded over LE, which is how FIDO
+  keys pair, BlueZ requires link encryption with the stored long-term key as it connects
+  (checked in BlueZ's `device.c`). So a device copying your key's address without that key
+  cannot complete a connection, as CTAP 2.1 section 11.4 requires. Newer BlueZ reports the LE
+  bond separately and the bridge checks that too. On older BlueZ (5.72 in Ubuntu 24.04) a bond
+  made over classic Bluetooth would also pass, which only matters if the configured address
+  belongs to a dual-mode device rather than your key.
+- **Local logins only.** The shipped PAM profile uses the key only for local services (display
+  managers, lock screens, `sudo`, `su`, console login, polkit). A remote password attempt over
+  `sshd` never reaches the key, so a stranger cannot make it ask for your fingerprint.
 - **Fingerprint, not just presence.** The recommended PAM line uses `userverification=1`. The
   key must verify your fingerprint itself, so a stolen key alone does not get in.
 - **CTAP2 only.** Legacy U2F messages, which cannot verify the user, are refused.
 - **Strict, bounded parsing** of every HID report and BLE fragment. Message sizes are capped at
   the protocol maxima, the notification queue is bounded, and a malformed stream drops the link.
-- **Nothing sensitive in the logs.** Message contents are never logged, only events and sizes.
+- **Nothing sensitive in the logs.** The bridge never logs message contents, and `-v` leaves the
+  payload-level debug output of `bleak` and `dbus-fast` switched off.
+- **Bounded in time.** Every request has a hard deadline (`request_timeout`), so a misbehaving
+  key or Bluetooth stack cannot hang a login prompt.
 - **Sandboxed service.** It runs as a throwaway `DynamicUser` with no capabilities, no network
   (D-Bus only), a read-only filesystem, a private `/dev` holding only `/dev/uhid`, and a
   system-call filter. See `packaging/fido2-ble-bridge.service`.
 - **Pinned dependencies.** The installer installs runtime dependencies (`bleak`, `dbus-fast`)
   from binary wheels only, verified against hashes from `uv.lock`.
 
-What it does **not** protect against: root on this machine (root can drive the key through the
-bridge or BlueZ directly, as it could drive a USB key); someone holding your key *and* your
-finger; relaying your key's radio from a distance while you touch it; or radio jamming, which
-only makes the login fall back to your password. Bluetooth pairing is system-wide, so any local
-root process can talk to the bonded key: the "system-wide pairing" caveat in CTAP 2.1
-section 11.4.13.1. See [SECURITY.md](SECURITY.md).
+What it does **not** protect against:
+
+- **Other local processes using the key through BlueZ.** Bluetooth pairing is system-wide, and
+  BlueZ's default D-Bus policy lets any local user talk to a bonded device. So any process on
+  this machine can connect to your key directly and ask it to sign. Each signature still needs
+  your fingerprint on the key. This is the "system-wide pairing" caveat of CTAP 2.1 section
+  11.4.13.1 and applies to every BLE security key on Linux. To narrow it, restrict
+  `org.bluez` to the `bluetooth` group in `/etc/dbus-1/system.d/bluetooth.conf`; that also
+  hides Bluetooth from desktop users outside the group.
+- **Root on this machine**, which can drive the key as it could a USB key.
+- **Someone with your key and your finger.**
+- **Relay attacks**, which forward your key's radio from a distance while you touch it.
+- **Radio jamming**, which only makes the login fall back to your password.
+
+The virtual hidraw node itself is reachable only by root and the logged-in desktop user, through
+systemd's standard FIDO udev rules (`60-fido-id.rules` with `uaccess`). See
+[SECURITY.md](SECURITY.md).
 
 ## Requirements
 
@@ -140,10 +160,20 @@ $ sudo rm /etc/pam.d/fido2-ble-test
 $ sudo pam-auth-update --enable fido2-ble-bridge
 ```
 
-This adds the key in front of your password for every service that uses `common-auth`: the
-display manager, the lock screen, `sudo`, `su`, polkit and console login. If the key is absent
-or fails, you get the password prompt as before. To undo: `sudo pam-auth-update --disable
-fido2-ble-bridge`.
+This puts the key in front of your password in `common-auth`, guarded so it applies only to
+local services: `gdm-password` (GNOME login and lock screen), `sddm`, `kde`, `lightdm`, common
+screen lockers, `sudo`, `sudo-i`, `su`, `su-l`, `login` and `polkit-1`. Remote services such as
+`sshd` skip it and ask for the password as before. To add a local service, append its PAM
+service name to the `service in …` list in `/usr/share/pam-configs/fido2-ble-bridge` and rerun
+`sudo pam-auth-update --enable fido2-ble-bridge`. If the key is absent or fails, you get the
+password prompt. To undo: `sudo pam-auth-update --disable fido2-ble-bridge`.
+
+`pam-auth-update` exists on Debian and Ubuntu. Elsewhere, add this line before the password
+module in the PAM files of the local services you want (for example `/etc/pam.d/sudo`):
+
+```
+auth sufficient pam_u2f.so authfile=/etc/fido2-ble-bridge/u2f_mappings origin=pam://fido2-ble-bridge cue userverification=1
+```
 
 ## Using it
 
@@ -180,7 +210,10 @@ the sensor. If the key does not appear in time, you get the password prompt.
 - `check` says **does not offer FIDO2 over BLE**: the key has no FIDO2 BLE service, or only
   legacy U2F over BLE, which this bridge does not support.
 - `check` times out: wake the key and make sure it is not connected to another device (a
-  phone, for example).
+  phone, for example) or to this computer through the desktop's Bluetooth settings. A
+  connected key does not advertise, so the bridge cannot find it.
+- `fido2-ble-bridge -v check` adds debug logs from the bridge only; message contents are never
+  logged.
 - `pamu2fcfg` registers the wrong key: it uses the first FIDO device it finds, so unplug other
   security keys while registering.
 
