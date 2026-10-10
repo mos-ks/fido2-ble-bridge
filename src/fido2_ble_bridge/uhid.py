@@ -209,16 +209,18 @@ class UhidDevice:
     def reply_set_report(self, request_id: int) -> None:
         self._write(pack_set_report_reply(request_id, errno.EIO))
 
-    def read_events(self) -> list[UhidEvent]:
+    def read_events(self, limit: int = 64) -> list[UhidEvent]:
+        """Up to `limit` pending events; the cap keeps a flooding client from starving the loop."""
         events: list[UhidEvent] = []
-        while True:
+        for _ in range(limit):
             try:
                 buf = os.read(self._fd, EVENT_SIZE)
             except BlockingIOError:
-                return events
+                break
             event = parse_event(buf)
             if event is not None:
                 events.append(event)
+        return events
 
     def close(self) -> None:
         if self._fd < 0:

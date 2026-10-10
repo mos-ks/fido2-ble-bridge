@@ -62,7 +62,10 @@ async def serve_device(
     async def tick() -> None:
         while True:
             await asyncio.sleep(TICK_INTERVAL)
-            bridge.tick()
+            try:
+                bridge.tick()
+            except Exception:
+                log.exception("CTAPHID timer failed")
 
     loop.add_reader(uhid.fileno(), on_readable)
     ticker = asyncio.create_task(tick())

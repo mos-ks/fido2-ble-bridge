@@ -1,7 +1,8 @@
 """Joins the virtual CTAPHID device to the BLE link: one CTAP2 request at a time, forwarded as-is.
 
-The bridge never interprets or creates CTAP2 messages. Whether a login succeeds is decided by
-the authenticator's signature, which the client (pam_u2f, a browser) verifies itself.
+The bridge does not interpret CTAP2 messages, and the only ones it makes up are failure
+statuses (timeout, cancel). Whether a login succeeds is decided by the authenticator's
+signature, which the client (pam_u2f, a browser) verifies itself.
 """
 
 from __future__ import annotations
@@ -93,7 +94,11 @@ class Bridge:
 
     def _apply(self, out: Output) -> None:
         for report in out.reports:
-            self._hid.send_input(report)
+            try:
+                self._hid.send_input(report)
+            except OSError as exc:
+                # The device is going away; keep going so no transaction is left without a task.
+                log.warning("writing a HID input report failed: %s", exc)
         for txn in out.cancelled:
             event = self._cancel_events.get(txn)
             if event is not None:

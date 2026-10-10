@@ -1,3 +1,4 @@
+import os
 import shutil
 import struct
 import subprocess
@@ -109,3 +110,19 @@ def test_parse_lifecycle_and_report_requests() -> None:
 )
 def test_output_report_payload(data: bytes, rtype: int, expected: bytes | None) -> None:
     assert uhid.output_report_payload(uhid.OutputEvent(data, rtype), 64) == expected
+
+
+def test_read_events_is_bounded_per_call() -> None:
+    reader, writer = os.pipe()
+    os.set_blocking(reader, False)
+    device = uhid.UhidDevice.__new__(uhid.UhidDevice)
+    device._fd = reader
+    device._created = False
+    close_event = struct.pack("=I", uhid.UHID_CLOSE).ljust(uhid.EVENT_SIZE, b"\0")
+    for _ in range(5):
+        os.write(writer, close_event)
+    # A pipe returns whatever is buffered, so read one event-sized chunk per call.
+    assert len(device.read_events(limit=2)) == 2
+    assert len(device.read_events(limit=64)) == 3
+    os.close(writer)
+    os.close(reader)

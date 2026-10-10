@@ -24,7 +24,7 @@ from fido2.webauthn import AuthenticatorData
 
 from fido2_ble_bridge.ble_link import FidoBleLink
 from fido2_ble_bridge.bridge import Bridge
-from fido2_ble_bridge.ctaphid import PACKET_SIZE
+from fido2_ble_bridge.ctaphid import BROADCAST_CID, PACKET_SIZE, Cmd, fragment
 
 T = TypeVar("T")
 RP = {"id": "pam://bridge-test", "name": "bridge test"}
@@ -220,3 +220,39 @@ async def test_all_handles_closed_cancels_in_flight_work(rig: Rig) -> None:
     request.cancel()
     rig.sink.inbox.put(b"\0" * PACKET_SIZE)  # unblock the client thread
     await asyncio.gather(request, return_exceptions=True)
+
+
+class _BrokenHid:
+    def __init__(self) -> None:
+        self.fail = False
+        self.sent: list[bytes] = []
+
+    def send_input(self, report: bytes) -> None:
+        if self.fail:
+            raise OSError("device gone")
+        self.sent.append(report)
+
+
+async def test_failing_hid_writes_do_not_strand_a_transaction() -> None:
+    # One Output can carry an error report (here: an expired half-sent message) and a new
+    # request; a failed write of the first must not stop the second from being dispatched.
+    hid = _BrokenHid()
+    now = [0.0]
+    link = FidoBleLink(SimulatedConnector(), idle_disconnect=60.0)
+    bridge = Bridge(hid, link, connect_timeout=1.0, clock=lambda: now[0])
+
+    def open_channel() -> int:
+        hid.sent.clear()
+        for report in fragment(BROADCAST_CID, Cmd.INIT, bytes(8)):
+            bridge.on_output_report(report)
+        return int.from_bytes(hid.sent[0][15:19], "big")
+
+    stalled, active = open_channel(), open_channel()
+    bridge.on_output_report(fragment(stalled, Cmd.CBOR, bytes(200))[0])
+    hid.fail = True
+    now[0] = 10.0
+    for report in fragment(active, Cmd.CBOR, b"\x04"):
+        bridge.on_output_report(report)
+    await asyncio.wait_for(bridge.drain(), 2.0)
+    assert not bridge._server.busy
+    await link.close()

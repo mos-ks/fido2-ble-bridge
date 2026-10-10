@@ -57,6 +57,14 @@ async def _check(config: Config) -> int:
     return 0
 
 
+def configure_logging(*, verbose: bool) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    logging.getLogger("fido2_ble_bridge").setLevel(logging.DEBUG if verbose else logging.INFO)
+    # bleak logs raw GATT reads and writes (CTAP payloads, PIN protocol data) at DEBUG.
+    for library in ("bleak", "dbus_fast"):
+        logging.getLogger(library).setLevel(logging.WARNING)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="fido2-ble-bridge",
@@ -76,10 +84,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     check_cmd.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
 
     args = parser.parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(levelname)s %(name)s: %(message)s",
-    )
+    configure_logging(verbose=args.verbose)
     try:
         if args.command == "scan":
             return asyncio.run(_scan(args.timeout, args.adapter))
