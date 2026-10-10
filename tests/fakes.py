@@ -198,6 +198,7 @@ class SimulatedFidoKey:
         disconnect_mid_request: bool = False,
         keepalive_forever: bool = False,
         hang_writes: bool = False,
+        ignore_cancel: bool = False,
     ) -> None:
         self.authenticator = authenticator
         self._on_disconnect = on_disconnect
@@ -211,6 +212,7 @@ class SimulatedFidoKey:
         self.disconnect_mid_request = disconnect_mid_request
         self.keepalive_forever = keepalive_forever
         self.hang_writes = hang_writes
+        self.ignore_cancel = ignore_cancel
         self.connected = True
         self.selected_revision: bytes | None = None
         self.writes: list[bytes] = []
@@ -277,6 +279,8 @@ class SimulatedFidoKey:
     def _dispatch(self, cmd: int, data: bytes) -> None:
         if cmd == 0xBE:
             self.cancels += 1
+            if self.ignore_cancel:
+                return
             if self._task is not None and not self._task.done():
                 self._task.cancel()
                 self.send_frame(0x83, bytes([CTAP2_ERR_KEEPALIVE_CANCEL]))

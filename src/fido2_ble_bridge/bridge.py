@@ -11,8 +11,9 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import Callable
-from typing import Protocol
+from collections import deque
+from collections.abc import Callable, Coroutine
+from typing import Any, Protocol
 
 from .ble_link import (
     ErrorResponse,
@@ -37,6 +38,10 @@ log = logging.getLogger(__name__)
 
 CTAP2_ERR_USER_ACTION_TIMEOUT = 0x2F
 KEEPALIVE_INTERVAL = 0.1
+# hidraw buffers 64 reports per reader and drops the rest, and the kernel offers no flow
+# control, so long responses go out in bursts with a pause for the reader to catch up.
+REPORT_BURST = 32
+BURST_PAUSE = 0.005
 
 
 class HidOutput(Protocol):
@@ -77,11 +82,14 @@ class Bridge:
         )
         self._cancel_events: dict[int, asyncio.Event] = {}
         self._tasks: set[asyncio.Task[None]] = set()
+        self._outbox: deque[bytes] = deque()
+        self._writer: asyncio.Task[None] | None = None
 
     def on_output_report(self, report: bytes) -> None:
         self._apply(self._server.handle_report(report, self._clock()))
 
     def on_all_closed(self) -> None:
+        self._outbox.clear()
         self._apply(self._server.abort_all())
 
     def tick(self) -> None:
@@ -93,24 +101,46 @@ class Bridge:
             await asyncio.gather(*self._tasks, return_exceptions=True)
 
     def _apply(self, out: Output) -> None:
-        for report in out.reports:
-            try:
-                self._hid.send_input(report)
-            except OSError as exc:
-                # The device is going away; keep going so no transaction is left without a task.
-                log.warning("writing a HID input report failed: %s", exc)
+        self._queue_reports(out.reports)
         for txn in out.cancelled:
             event = self._cancel_events.get(txn)
             if event is not None:
                 event.set()
         for request in out.requests:
-            task = asyncio.create_task(self._forward(request))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            # Registered before the task runs: a cancel or close read in the same batch of
+            # uhid events as the request must still find it.
+            cancelled = asyncio.Event()
+            self._cancel_events[request.txn] = cancelled
+            self._spawn(self._forward(request, cancelled))
 
-    async def _forward(self, request: Request) -> None:
-        cancelled = asyncio.Event()
-        self._cancel_events[request.txn] = cancelled
+    def _spawn(self, coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    def _queue_reports(self, reports: list[bytes]) -> None:
+        self._outbox.extend(reports)
+        if self._writer is None or self._writer.done():
+            self._write_burst()
+            if self._outbox:
+                self._writer = self._spawn(self._write_paced())
+
+    async def _write_paced(self) -> None:
+        while self._outbox:
+            await asyncio.sleep(BURST_PAUSE)
+            self._write_burst()
+
+    def _write_burst(self) -> None:
+        for _ in range(min(REPORT_BURST, len(self._outbox))):
+            report = self._outbox.popleft()
+            try:
+                self._hid.send_input(report)
+            except OSError as exc:
+                # The device is going away; keep going so no transaction is left without a task.
+                log.warning("writing a HID input report failed: %s", exc)
+
+    async def _forward(self, request: Request, cancelled: asyncio.Event) -> None:
         status = [KeepaliveStatus.PROCESSING if self._link.connected else KeepaliveStatus.UPNEEDED]
 
         def on_keepalive(code: int) -> None:

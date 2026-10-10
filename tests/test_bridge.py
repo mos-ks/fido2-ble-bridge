@@ -15,7 +15,7 @@ import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
-from fakes import AAGUID, SimulatedConnector, SoftAuthenticator
+from fakes import AAGUID, SimulatedConnector, SoftAuthenticator, assertion_request
 from fido2.ctap import CtapError
 from fido2.ctap2.base import Ctap2
 from fido2.hid import CtapHidDevice
@@ -255,4 +255,74 @@ async def test_failing_hid_writes_do_not_strand_a_transaction() -> None:
         bridge.on_output_report(report)
     await asyncio.wait_for(bridge.drain(), 2.0)
     assert not bridge._server.busy
+    await link.close()
+
+
+def _requests_reaching_key(connector: SimulatedConnector) -> int:
+    return sum(1 for key in connector.sessions for w in key.writes if w[0] == 0x83)
+
+
+async def _open_channel(bridge: Bridge, sink: _HidSink) -> int:
+    for report in fragment(BROADCAST_CID, Cmd.INIT, bytes(8)):
+        bridge.on_output_report(report)
+    return int.from_bytes(sink.inbox.get(timeout=1)[15:19], "big")
+
+
+@pytest.mark.parametrize("warm", [False, True])
+async def test_close_read_with_the_request_still_cancels_it(warm: bool) -> None:
+    # uhid can deliver a request's last packet and the client's close in one read batch.
+    connector = SimulatedConnector(SoftAuthenticator(user_wait=5.0))
+    rig = make_rig(connector)
+    if warm:
+        await rig.ctap2()
+    sent_before = _requests_reaching_key(connector)
+    cid = await _open_channel(rig.bridge, rig.sink)
+    for report in fragment(cid, Cmd.CBOR, assertion_request()):
+        rig.bridge.on_output_report(report)
+    rig.bridge.on_all_closed()
+    await asyncio.wait_for(rig.bridge.drain(), 2.0)
+    assert _requests_reaching_key(connector) == sent_before
+    await rig.link.close()
+
+
+async def test_cancel_read_with_the_request_is_honoured(rig: Rig) -> None:
+    rig.connector.authenticator.user_wait = 5.0
+    await rig.ctap2()
+    cid = await _open_channel(rig.bridge, rig.sink)
+    for report in fragment(cid, Cmd.CBOR, assertion_request()):
+        rig.bridge.on_output_report(report)
+    rig.bridge.on_output_report(fragment(cid, Cmd.CANCEL, b"")[0])
+    await asyncio.wait_for(rig.bridge.drain(), 2.0)
+    replies = []
+    while not rig.sink.inbox.empty():
+        replies.append(rig.sink.inbox.get())
+    final = [r for r in replies if r[4] == Cmd.CBOR]
+    assert final and final[-1][7] == CtapError.ERR.KEEPALIVE_CANCEL
+
+
+class _TimedSink(_HidSink):
+    def __init__(self) -> None:
+        super().__init__()
+        self.times: list[float] = []
+
+    def send_input(self, report: bytes) -> None:
+        self.times.append(asyncio.get_running_loop().time())
+        super().send_input(report)
+
+
+async def test_long_responses_are_paced_for_hidraw() -> None:
+    response = b"\x00" + bytes(7000)
+    connector = SimulatedConnector(responder=lambda _data: response)
+    link = FidoBleLink(connector, idle_disconnect=60.0)
+    sink = _TimedSink()
+    bridge = Bridge(sink, link, connect_timeout=2.0)
+    cid = await _open_channel(bridge, sink)
+    sink.times.clear()
+    for report in fragment(cid, Cmd.CBOR, b"\x04"):
+        bridge.on_output_report(report)
+    await asyncio.wait_for(bridge.drain(), 5.0)
+    data = [t for t in sink.times]
+    assert len(data) >= 119
+    burst = max(sum(1 for u in data if t <= u < t + 0.002) for t in data)
+    assert burst <= 32
     await link.close()

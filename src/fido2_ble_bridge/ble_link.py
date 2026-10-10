@@ -110,6 +110,7 @@ class FidoBleLink:
         *,
         idle_disconnect: float = 10.0,
         request_timeout: float = 60.0,
+        absent_backoff: float = 2.0,
         handshake_timeout: float = 5.0,
         silence_timeout: float = 5.0,
         cancel_grace: float = 3.0,
@@ -118,6 +119,8 @@ class FidoBleLink:
         self._connector = connector
         self._idle_disconnect = idle_disconnect
         self._request_timeout = request_timeout
+        self._absent_backoff = absent_backoff
+        self._unreachable_until = 0.0
         self._handshake_timeout = handshake_timeout
         self._silence_timeout = silence_timeout
         self._cancel_grace = cancel_grace
@@ -175,7 +178,8 @@ class FidoBleLink:
     ) -> Response:
         reused = self._session is not None
         session = await self._session_or_cancel(connect_timeout, cancelled)
-        if session is None:
+        if session is None or cancelled.is_set():
+            # Cancelled while queued or connecting: the key never sees the request.
             return MsgResponse(bytes([CTAP2_ERR_KEEPALIVE_CANCEL]))
         try:
             await self._send(session, payload)
@@ -186,7 +190,7 @@ class FidoBleLink:
                 raise
             log.info("kept-open BLE link was stale, reconnecting")
             session = await self._session_or_cancel(connect_timeout, cancelled)
-            if session is None:
+            if session is None or cancelled.is_set():
                 return MsgResponse(bytes([CTAP2_ERR_KEEPALIVE_CANCEL]))
             await self._send(session, payload)
         return await self._receive(session, on_keepalive, cancelled)
@@ -196,6 +200,11 @@ class FidoBleLink:
     ) -> GattSession | None:
         if self._session is not None:
             return self._session
+        loop = asyncio.get_running_loop()
+        if loop.time() < self._unreachable_until:
+            # pam_u2f reopens the device once per registered credential; with the key away,
+            # each reopen would otherwise wait the full connect timeout again.
+            raise KeyNotReachable("authenticator was unreachable moments ago")
         opener = asyncio.create_task(self._open(timeout))
         canceller = asyncio.create_task(cancelled.wait())
         try:
@@ -205,7 +214,11 @@ class FidoBleLink:
             if not opener.done():
                 opener.cancel()
         if opener in done:
-            return opener.result()
+            try:
+                return opener.result()
+            except KeyNotReachable:
+                self._unreachable_until = loop.time() + self._absent_backoff
+                raise
         await asyncio.wait({opener})
         if not opener.cancelled() and opener.exception() is not None:
             log.debug("connect abandoned after cancel: %r", opener.exception())
@@ -273,18 +286,20 @@ class FidoBleLink:
         on_keepalive: Callable[[int], None],
         cancelled: asyncio.Event,
     ) -> Response:
-        cancel_sent = False
+        loop = asyncio.get_running_loop()
+        cancel_deadline: float | None = None
         while True:
-            event = await self._next_event(
-                None if cancel_sent else cancelled,
-                self._cancel_grace if cancel_sent else self._silence_timeout,
-            )
+            if cancel_deadline is None:
+                event = await self._next_event(cancelled, self._silence_timeout)
+            else:
+                # Absolute: keepalives after a CANCEL must not extend the wait.
+                event = await self._next_event(None, max(0.0, cancel_deadline - loop.time()))
             if isinstance(event, _CancelRequested):
                 await self._send_cancel(session)
-                cancel_sent = True
+                cancel_deadline = loop.time() + self._cancel_grace
                 continue
             if event is None:
-                if cancel_sent:
+                if cancel_deadline is not None:
                     # BLE frames carry no request ID: a reply arriving later would be read as
                     # the answer to the next request, so this link cannot be reused.
                     await self._drop_session("cancel not acknowledged")

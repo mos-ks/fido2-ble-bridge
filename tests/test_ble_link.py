@@ -298,3 +298,46 @@ async def test_garbage_notifications_fail_the_request() -> None:
         async with asyncio.timeout(2.0):
             await ask(link)
     await injector
+
+
+async def test_request_cancelled_while_queued_never_reaches_the_key() -> None:
+    connector = SimulatedConnector()
+    link = make_link(connector)
+    await ask(link)
+    writes_before = len(connector.last.writes)
+    cancelled = asyncio.Event()
+    cancelled.set()
+    assert await ask(link, cancelled=cancelled) == MsgResponse(bytes([CTAP2_ERR_KEEPALIVE_CANCEL]))
+    assert len(connector.last.writes) == writes_before
+    await link.close()
+
+
+async def test_cancel_grace_is_not_extended_by_keepalives() -> None:
+    connector = SimulatedConnector(
+        SoftAuthenticator(user_wait=30.0), ignore_cancel=True, keepalive_interval=0.02
+    )
+    link = make_link(connector, silence_timeout=5.0, cancel_grace=0.3)
+    cancelled = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.1, cancelled.set)
+    started = asyncio.get_running_loop().time()
+    response = await ask(link, assertion_request(), cancelled=cancelled)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert response == MsgResponse(bytes([CTAP2_ERR_KEEPALIVE_CANCEL]))
+    assert elapsed < 1.0
+    assert not link.connected
+
+
+async def test_absent_key_fails_fast_for_a_moment_then_is_retried() -> None:
+    connector = SimulatedConnector(reachable=False)
+    link = FidoBleLink(connector, absent_backoff=0.3)
+    with pytest.raises(KeyNotReachable):
+        await ask(link, connect_timeout=0.2)
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(KeyNotReachable, match="moments ago"):
+        await ask(link, connect_timeout=0.2)
+    assert asyncio.get_running_loop().time() - started < 0.1
+    assert connector.connect_calls == 1
+    await asyncio.sleep(0.35)
+    with pytest.raises(KeyNotReachable):
+        await ask(link, connect_timeout=0.2)
+    assert connector.connect_calls == 2

@@ -198,13 +198,14 @@ class CtapHidServer:
         if cmd == Cmd.INIT:
             self._handle_init(cid, length, data, out)
             return
-        if cid == BROADCAST_CID or cid not in self._channels:
-            self._error(cid, HidError.INVALID_CHANNEL, out)
-            return
         if cmd == Cmd.CANCEL:
+            # Never answered, on any channel (CTAP 2.1, 11.2.9.1.5).
             active = self._active
             if isinstance(active, _Processing) and active.cid == cid:
                 out.cancelled.append(active.txn)
+            return
+        if cid == BROADCAST_CID or cid not in self._channels:
+            self._error(cid, HidError.INVALID_CHANNEL, out)
             return
         if self._active is not None:
             if isinstance(self._active, _Assembling) and self._active.cid == cid:

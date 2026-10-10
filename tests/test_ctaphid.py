@@ -273,3 +273,9 @@ def test_abort_all_cancels_and_forgets_channels() -> None:
     assert server.abort_all().cancelled == [request.txn]
     assert not server.busy
     assert_error(send(server, cid, Cmd.CBOR, b"\x04"), cid, HidError.INVALID_CHANNEL)
+
+
+def test_cancel_is_never_answered_even_on_bad_channels() -> None:
+    server = make_server()
+    assert send(server, 0xDEADBEEF, Cmd.CANCEL, b"") == Output()
+    assert send(server, BROADCAST_CID, Cmd.CANCEL, b"") == Output()
