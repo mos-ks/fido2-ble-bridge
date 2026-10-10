@@ -1,9 +1,10 @@
-# Python-generated files
+# Python-generated files (linux/). Build outputs are anchored so they cannot hide a windows/
+# directory of the same name.
 __pycache__/
 *.py[oc]
-build/
-dist/
-wheels/
+/linux/build/
+/linux/dist/
+/linux/wheels/
 *.egg-info
 
 # Virtual environments
@@ -13,3 +14,10 @@ wheels/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+
+# .NET build outputs and IDE state (windows/)
+bin/
+obj/
+.vs/
+*.user
+TestResults/

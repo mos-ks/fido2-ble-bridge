@@ -8,19 +8,26 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  linux:
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         python: ["3.11", "3.12", "3.13"]
+    defaults:
+      run:
+        working-directory: linux
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
+          # The uv that wrote linux/uv.lock (lock revision 3); a newer uv must not decide what
+          # `uv sync --locked` accepts or what the installer's requirements are checked against.
+          version: "0.12.17"
           python-version: ${{ matrix.python }}
+          working-directory: linux
       - run: uv sync --locked
       - name: Installer requirements match uv.lock
         run: |
@@ -51,3 +58,38 @@ jobs:
         run: |
           uv run pytest -m uhid -q -rs | tee e2e.txt
           ! grep -q SKIPPED e2e.txt
+
+  windows:
+    runs-on: windows-2025
+    defaults:
+      run:
+        working-directory: windows
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: "10.0.x"
+      - run: dotnet build Fido2BleLogon.slnx -c Release -warnaserror
+      - run: dotnet test tests/Fido2BleLogon.Core.Tests -c Release --no-build
+      - name: Credential provider self-test (offline, simulated key, no Bluetooth)
+        run: |
+          $exe = Get-ChildItem -Recurse -Filter fido2-ble-logon-cphost.exe src/Fido2BleLogon.CpHarness/bin |
+            Where-Object FullName -match '\\Release\\' | Select-Object -First 1
+          if (-not $exe) { throw 'the harness was not built' }
+          & $exe.FullName selftest
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & $exe.FullName credui
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: PowerShell scripts parse under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $bad = 0
+          foreach ($script in Get-ChildItem scripts -Filter *.ps1) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref]$null, [ref]$errors)
+            if ($errors) { $errors; $bad++ }
+          }
+          if ($bad) { exit 1 }
