@@ -250,7 +250,10 @@ public sealed class SecurityKeyProvider : ICredentialProvider, ICredentialProvid
             }
             else
             {
-                LogCount("GetCredentialCount: 1 credential, no default");
+                // Ask LogonUI to preselect this tile for the enrolled user (alongside the UserTile value it may
+                // or may not honor). Never auto-logon here: that needs a password from the key.
+                pdwDefault = 0;
+                LogCount("GetCredentialCount: 1 credential, default 0 (no auto-logon)");
             }
             return S_OK;
         }

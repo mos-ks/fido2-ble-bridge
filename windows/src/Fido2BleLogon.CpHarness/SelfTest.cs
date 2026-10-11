@@ -133,7 +133,7 @@ internal static class SelfTest
 
             uint count = s.Enumerate(print: false, out uint def, out int auto);
             Check(count == 1 && s.Credential is not null, "one credential");
-            Check(def == CredentialProviderConstants.CREDENTIAL_PROVIDER_NO_DEFAULT && auto == 0, "no default tile and no auto-logon before a fingerprint");
+            Check(def == 0 && auto == 0, "tile preselected (default 0) but no auto-logon before a fingerprint");
             Check(s.LastBitmap == (TileImage.Size, TileImage.Size, 32), $"tile image is a {TileImage.Size}x{TileImage.Size} 32-bpp bitmap");
             Check(s.UserSid == Sid, "GetUserSid returns the enrolled SID");
             Check(!Fakes.LinkVisible && Fakes.Status == "", "initially: no status, link hidden");
@@ -192,7 +192,7 @@ internal static class SelfTest
         LogonBuffer.Free(ser.rgbSerialization, ser.cbSerialization);
         Check(again == CREDENTIAL_PROVIDER_GET_SERIALIZATION_RESPONSE.CPGSR_NO_CREDENTIAL_NOT_FINISHED, "the password is gone after one serialization");
         s.Provider.GetCredentialCount(out _, out def, out autoLogon);
-        Check(def == CredentialProviderConstants.CREDENTIAL_PROVIDER_NO_DEFAULT && autoLogon == 0, "auto-logon flag cleared");
+        Check(def == 0 && autoLogon == 0, "auto-logon flag cleared (tile stays preselected)");
 
         Check(DefaultTileCalls.IsEmpty, "the preselected sign-in option is untouched until Windows accepts the logon");
         c.ReportResult(NtStatus.STATUS_SUCCESS, 0, out string? text, out var icon);
@@ -282,7 +282,7 @@ internal static class SelfTest
             Check(Key.Buffers.Length == 1 && !FakeKey.IsCleared(Key.Buffers[0]), "the tile holds the password buffer");
             Pump(800); // past the 600 ms window, before the expiry timer (window + 500 ms)
             s.Provider.GetCredentialCount(out _, out uint def, out int auto);
-            Check(def == CredentialProviderConstants.CREDENTIAL_PROVIDER_NO_DEFAULT && auto == 0, "after the window: no auto-logon offered");
+            Check(def == 0 && auto == 0, "after the window: no auto-logon offered");
             c.SetDeselected();
             Check(FakeKey.IsCleared(Key.Buffers[0]), "deselect after the auto-logon window: the password buffer is cleared at once");
             c.GetSerialization(out var response, out var ser, out _, out _);
@@ -671,7 +671,7 @@ internal static class SelfTest
         Check(PumpUntil(() => LinkIs(Tile.TryAgainText) && Fakes.Status == Tile.StatusSignInNotStarted), $"after the window: \"{Tile.StatusSignInNotStarted}\"");
         Check(FakeKey.IsCleared(Key.Buffers[0]), "the expired password buffer is cleared");
         s.Provider.GetCredentialCount(out _, out def, out auto);
-        Check(def == CredentialProviderConstants.CREDENTIAL_PROVIDER_NO_DEFAULT && auto == 0, "auto-logon withdrawn");
+        Check(def == 0 && auto == 0, "auto-logon withdrawn");
         c.GetSerialization(out var response, out var ser, out _, out _);
         LogonBuffer.Free(ser.rgbSerialization, ser.cbSerialization);
         Check(response == CREDENTIAL_PROVIDER_GET_SERIALIZATION_RESPONSE.CPGSR_NO_CREDENTIAL_NOT_FINISHED, "the password was dropped");
@@ -760,7 +760,7 @@ internal static class SelfTest
         Check(s.Start(cpus, 0, setUserArray, print: false) == S_OK, $"SetUsageScenario({cpus}) -> S_OK");
         uint count = s.Enumerate(print: false, out uint def, out int auto);
         Check(count == 1 && s.Credential is not null, "one credential");
-        Check(def == CredentialProviderConstants.CREDENTIAL_PROVIDER_NO_DEFAULT && auto == 0, "no default, no auto-logon yet");
+        Check(def == 0 && auto == 0, "preselected, no auto-logon yet");
         if (s.Credential is null)
             throw new InvalidOperationException("no credential to test");
         return s;
