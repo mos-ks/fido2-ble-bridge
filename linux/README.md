@@ -569,6 +569,11 @@ the service after editing (`sudo systemctl restart fido2-ble-bridge`).
   phone, for example) or to this computer through the desktop's Bluetooth settings. A
   connected key does not advertise, so the bridge cannot find it. If the key was reset or
   paired with another computer since, its pairing here is stale: remove it and run setup again.
+- `check` says BlueZ **kept refusing to scan** (`org.bluez.Error.InProgress`), and
+  `bluetoothctl scan le` fails the same way while `bluetoothctl show` reports `Discovering: no`:
+  the Bluetooth controller is stuck, and the kernel log (`journalctl -k`) repeats
+  `Opcode 0x2041 failed: -16` and `start background scanning failed: -16`. Logins cannot reach
+  the key until the adapter is reset: `bluetoothctl power off`, then `bluetoothctl power on`.
 - Setup's **login test fails**: nothing was saved, so `/etc/fido2-ble-bridge/u2f_mappings` and
   PAM are as they were, and an earlier registration still works. Check the enrolled finger
   before trying again (`fido2-token -I /dev/hidrawN` must list `uv`).

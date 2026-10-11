@@ -220,6 +220,8 @@ async def wait_for_advertisement(
 
     BlueZ refuses a new scan from a client whose earlier scan is still running (InProgress), so
     the scan is always stopped, even when the caller is cancelled, and a refused start is retried.
+    BlueZ also answers InProgress whenever the kernel refuses to start discovery, which a stuck
+    controller does on every attempt until it is reset; the final error says so.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -237,7 +239,11 @@ async def wait_for_advertisement(
             if exc.dbus_error != "org.bluez.Error.InProgress":
                 raise
             if loop.time() + SCAN_RETRY_DELAY >= deadline:
-                raise KeyNotReachable(f"could not scan for the authenticator: {exc}") from exc
+                raise KeyNotReachable(
+                    f"BlueZ kept refusing to scan for the authenticator ({exc.dbus_error}); the "
+                    "Bluetooth adapter is probably stuck: turn it off and on with "
+                    "`bluetoothctl power off` and `bluetoothctl power on`"
+                ) from exc
             log.debug("BlueZ refused the scan (%s), retrying", exc.dbus_error)
             await asyncio.sleep(SCAN_RETRY_DELAY)
             continue
@@ -257,8 +263,9 @@ class BleakGattConnector:
     """Connects to the bonded key through the device object BlueZ keeps for it.
 
     A sleeping key is reachable only once it advertises again, so unless BlueZ already has it
-    connected, the connector first scans for its advertisement. (BlueZ's own LE connect is meant to
-    wait for that too, but on real hardware it did not notice a key being woken.)
+    connected, the connector first scans for its advertisement. BlueZ's own LE connect waits for
+    it too, through the kernel's background scan, but when the adapter refuses to scan that
+    connect just never completes; the explicit scan reports the refusal instead.
     """
 
     def __init__(self, address: str, adapter: str | None = None) -> None:

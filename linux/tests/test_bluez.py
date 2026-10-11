@@ -113,6 +113,18 @@ async def test_scan_times_out_when_the_key_stays_asleep() -> None:
     assert script["running"] == 0
 
 
+async def test_scan_refused_until_the_deadline_points_at_the_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bluez, "SCAN_RETRY_DELAY", 0.01)
+    script = _script(refusals=1000)
+    with pytest.raises(KeyNotReachable, match="bluetoothctl power off") as raised:
+        await wait_for_advertisement(lambda cb: _Scanner(cb, script), "AA:BB", 0.1)  # type: ignore[arg-type,return-value]
+    assert "org.bluez.Error.InProgress" in str(raised.value)
+    assert script["starts"] > 1  # retried before giving up
+    assert script["running"] == 0
+
+
 async def test_scan_is_stopped_even_when_the_wait_is_cancelled() -> None:
     script = _script(advertise_after=None)
     waiter = asyncio.create_task(
