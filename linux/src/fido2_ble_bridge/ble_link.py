@@ -71,10 +71,6 @@ class _WriteFailed(LinkError):
 
 
 class GattSession(Protocol):
-    @property
-    def fragment_limit(self) -> int:
-        """Largest single write the link carries (ATT_MTU - 3)."""
-
     async def read_revision_bitfield(self) -> bytes | None: ...
     async def write_revision_bitfield(self, value: bytes) -> None: ...
     async def read_control_point_length(self) -> bytes: ...
@@ -328,7 +324,11 @@ class FidoBleLink:
         control_point_length = int.from_bytes(raw, "big")
         if not MIN_FRAGMENT <= control_point_length <= MAX_FRAGMENT:
             raise LinkError(f"fidoControlPointLength {control_point_length} out of range")
-        self._fragment_size = max(MIN_FRAGMENT, min(control_point_length, session.fragment_limit))
+        # Fragments as long as the key allows, never shorter: some keys (Feitian AllinPass K33)
+        # refuse a message whose fragments are shorter than fidoControlPointLength, and on BlueZ
+        # the write limit bleak reports is often the 20-byte default rather than the real MTU.
+        # Fragments go out as ATT write requests, which BlueZ turns into a long write if needed.
+        self._fragment_size = control_point_length
         self._assembler.reset()
         self._drain()
         await session.start_status_notifications(

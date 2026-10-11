@@ -239,10 +239,6 @@ class SimulatedFidoKey:
         self._rx = bytearray()
         self._task: asyncio.Task[None] | None = None
 
-    @property
-    def fragment_limit(self) -> int:
-        return self.mtu - 3
-
     async def read_revision_bitfield(self) -> bytes | None:
         return self.revision
 
@@ -277,7 +273,7 @@ class SimulatedFidoKey:
             await asyncio.Event().wait()
         if self.write_attempts == self.fail_write:
             raise OSError("le-connection-abort-by-local")
-        limit = min(int.from_bytes(self.control_point_length, "big"), self.fragment_limit)
+        limit = int.from_bytes(self.control_point_length, "big")
         assert len(fragment) <= limit, f"fragment of {len(fragment)} bytes exceeds {limit}"
         self.writes.append(fragment)
         if fragment[0] & 0x80:
@@ -291,6 +287,10 @@ class SimulatedFidoKey:
             assert fragment[0] == self._rx_seq, f"seq {fragment[0]} != expected {self._rx_seq}"
             self._rx += fragment[1:]
             self._rx_seq = (self._rx_seq + 1) % 128
+        if self._rx_cmd is not None and len(self._rx) < self._rx_len:
+            # Like real keys (a Feitian AllinPass K33 answers ERR_INVALID_LEN): only the last
+            # fragment of a message may be shorter than fidoControlPointLength.
+            assert len(fragment) == limit, f"non-final fragment of {len(fragment)} bytes < {limit}"
         if self._rx_cmd is not None and len(self._rx) >= self._rx_len:
             cmd, data = self._rx_cmd, bytes(self._rx[: self._rx_len])
             self._rx_cmd = None
@@ -345,7 +345,7 @@ class SimulatedFidoKey:
 
     def send_frame(self, cmd: int, data: bytes) -> None:
         assert self._notify is not None, "notifications not enabled"
-        size = self.fragment_limit
+        size = self.mtu - 3
         self._notify(bytes([cmd, len(data) >> 8, len(data) & 0xFF]) + data[: size - 3])
         rest = data[size - 3 :]
         seq = 0

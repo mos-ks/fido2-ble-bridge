@@ -65,18 +65,24 @@ async def test_handshake_selects_fido2_and_get_info_round_trips() -> None:
     assert not connector.last.connected
 
 
-async def test_fragment_size_is_bounded_by_mtu_as_well_as_control_point_length() -> None:
-    connector = SimulatedConnector(control_point_length=(512).to_bytes(2, "big"), mtu=23)
+async def test_fragments_fill_the_control_point_length_whatever_the_mtu() -> None:
+    # The K33 case: fidoControlPointLength 155, while bleak on BlueZ reports a 20-byte write limit.
+    payload = bytes(range(200)) * 2
+    connector = SimulatedConnector(
+        control_point_length=(155).to_bytes(2, "big"), mtu=23, responder=lambda data: data
+    )
     link = make_link(connector)
-    await ask(link)
-    assert link.fragment_size == 20
-    assert max(len(w) for w in connector.last.writes) <= 20
+    assert await ask(link, payload) == MsgResponse(payload)
+    assert link.fragment_size == 155
+    assert [len(w) for w in connector.last.writes] == [155, 155, 95]
     await link.close()
 
 
 async def test_large_frames_survive_sequence_wraparound_both_ways() -> None:
     payload = bytes(i % 253 for i in range(3000))
-    connector = SimulatedConnector(mtu=23, responder=lambda data: data)
+    connector = SimulatedConnector(
+        control_point_length=(20).to_bytes(2, "big"), mtu=23, responder=lambda data: data
+    )
     link = make_link(connector)
     response = await ask(link, payload)
     assert response == MsgResponse(payload)

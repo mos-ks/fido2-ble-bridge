@@ -118,10 +118,6 @@ class BleakGattSession:
         self._control_point_length = _required(service, CONTROL_POINT_LENGTH_UUID)
         self._revision_bitfield = service.get_characteristic(SERVICE_REVISION_BITFIELD_UUID)
 
-    @property
-    def fragment_limit(self) -> int:
-        return self._control_point.max_write_without_response_size
-
     async def read_revision_bitfield(self) -> bytes | None:
         if self._revision_bitfield is None:
             return None
