@@ -54,10 +54,12 @@ key's PIN counts like a fingerprint, so use a strong key PIN and turn on device 
 
 ## Tested hardware
 
-- **Linux:** verified by the test suite, including end-to-end runs through the real kernel
-  (`uhid`, hidraw), libfido2, `pamu2fcfg` and `pam_u2f` with only the Bluetooth radio
-  simulated. Not yet confirmed on a physical BLE key; if you try one, please report the model
-  as described in [linux/README.md](linux/README.md#status).
+- **Linux:** confirmed on a Feitian AllinPass K33 with Ubuntu 24.04 (ARM64, BlueZ 5.72):
+  pairing, registration and a fingerprint login through `pam_u2f`. The K33 keeps bonds with two
+  computers, but only one can be connected at a time. The test suite also runs end to end
+  through the real kernel (`uhid`, hidraw), libfido2, `pamu2fcfg` and `pam_u2f` with only the
+  Bluetooth radio simulated. If you try another key, please report the model as described in
+  [linux/README.md](linux/README.md#status).
 - **Windows:** confirmed on a Feitian AllinPass K33 with Windows 11 (local account): pairing,
   enrollment and fingerprint sign-in on the real lock screen. The tile is also covered by an offline
   self-test that drives it the way LogonUI does, and the core by unit tests against a simulated

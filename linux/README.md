@@ -605,8 +605,16 @@ end to end through the real kernel (`uhid`, hidraw), libfido2's `fido2-token`,
 its refusal on a failed fingerprint or a wrong signature, and setup's registration and login
 test.
 
-**Not yet confirmed on physical BLE keys.** If you try it, please open an issue with the key
-model and the output of `fido2-ble-bridge check`, so this section can list keys that work.
+**Confirmed on hardware** with a Feitian AllinPass K33 (FIDO2 over Bluetooth LE and a
+fingerprint sensor; CTAP 2.0 and 2.1-PRE) on Ubuntu 24.04 ARM64 with BlueZ 5.72: pairing,
+setup's registration and its login test through `pam_u2f`. The K33 keeps bonds with two
+computers, but only one can be connected at a time. It refuses messages split into fragments
+shorter than its `fidoControlPointLength`, sends a single keepalive while it waits for the
+finger, and sometimes asks for its PIN when registering (`pamu2fcfg` then prompts for it); the
+bridge and setup handle all of these.
+
+If you try another key, please open an issue with the key model and the output of
+`fido2-ble-bridge check`, so this section can list keys that work.
 
 ## Development
 
