@@ -770,7 +770,7 @@ EncSize=16
 EDiv=0
 Rand=0
 """
-LINK_GROUP = "[ConnectionParameters]\nMinInterval=24\nMaxInterval=40\nLatency=0\nTimeout=500\n"
+LINK_GROUP = "[ConnectionParameters]\nMinInterval=16\nMaxInterval=16\nLatency=0\nTimeout=500\n"
 
 
 def bond_info(
@@ -872,7 +872,7 @@ def test_parameters_that_already_allow_the_timeout_are_kept_without_asking(world
     setup = paired_setup(world)
     assert setup.link(KEY) is False
     assert info.read_text() == text + "Timeout=600\n"
-    assert "already allow 5 s" in world.console.text
+    assert "connection timing is already set" in world.console.text
     assert world.runner.ran("systemctl", "restart") == []
 
 
@@ -888,10 +888,41 @@ def test_parameters_the_key_asked_for_are_replaced_and_their_undo_recorded(world
     ]
 
 
+def test_a_range_that_lets_the_controller_pick_a_slow_interval_is_narrowed(world: World) -> None:
+    # What a K33 asks for when offered intervals below 20 ms: 20 to 50 ms, and the controller
+    # then picks near 50.
+    asked = "[ConnectionParameters]\nMinInterval=16\nMaxInterval=40\nLatency=0\nTimeout=400\n"
+    info = bond_info(world.paths, BOND_INFO + "\n" + asked)
+    setup = paired_setup(world, "y")
+    assert setup.link(KEY) is True
+    assert info.read_text() == BOND_INFO + "\n" + LINK_GROUP
+    assert [change.undo for change in setup.changes] == [
+        f"set [ConnectionParameters] in {info} back to MinInterval=16, MaxInterval=40, "
+        "Latency=0, Timeout=400, then sudo systemctl restart bluetooth"
+    ]
+
+
+@pytest.mark.parametrize(
+    "group",
+    [
+        # Slower intervals than ours only come from the key: rewriting would make it ask again.
+        "MinInterval=24\nMaxInterval=40\nLatency=0\nTimeout=500\n",
+        # A timeout of 2 s or more, as a key may ask for one.
+        "MinInterval=16\nMaxInterval=16\nLatency=0\nTimeout=400\n",
+    ],
+)
+def test_parameters_the_key_asked_for_are_respected(world: World, group: str) -> None:
+    text = BOND_INFO + "\n[ConnectionParameters]\n" + group
+    info = bond_info(world.paths, text)
+    setup = paired_setup(world)
+    assert setup.link(KEY) is False
+    assert info.read_text() == text
+
+
 def test_without_bluez_settings_for_the_key_its_link_is_left_alone(world: World) -> None:
     setup = paired_setup(world)
     assert setup.link(KEY) is False
-    assert "keep the default supervision timeout of 0.42 s" in world.console.text
+    assert "keep the default timing (30 to 50 ms intervals, 0.42 s timeout)" in world.console.text
     assert world.console.answers == []
     assert world.runner.ran("systemctl", "restart") == []
 

@@ -63,12 +63,19 @@ STEPS = 8
 BLUEZ_STORAGE = "/var/lib/bluetooth"
 # The key's LE connection parameters, as BlueZ keeps them in its settings file for the key and
 # loads them into the kernel when bluetoothd starts (intervals in 1.25 ms, timeout in 10 ms).
-# The kernel's own defaults, except for the supervision timeout: 5 s instead of 0.42 s, which a
-# key that pauses its radio a little longer, busy or a few metres away, misses mid-login.
+# Instead of the kernel's defaults: a 5 s supervision timeout rather than 0.42 s, which a key
+# that pauses its radio a little longer, busy or a few metres away, misses mid-login; and a
+# 20 ms interval rather than 30 to 50 ms (the controller picks near 50). A login exchanges some
+# thirty requests and responses with the key before it asks for the finger (encryption, BlueZ's
+# GATT reads, the FIDO handshake, getInfo, pam_u2f's checks), each about two intervals long.
+# 20 ms is as fast as a Feitian AllinPass K33 accepts: offered less, it asks for 20 to 50 ms and
+# a 4 s timeout, and BlueZ stores what a key asks for over these values.
 SUPERVISION_TIMEOUT = 500
+MIN_SUPERVISION_TIMEOUT = 200
+INTERVAL = 16
 LINK_PARAMETERS = (
-    ("MinInterval", 24),
-    ("MaxInterval", 40),
+    ("MinInterval", INTERVAL),
+    ("MaxInterval", INTERVAL),
     ("Latency", 0),
     ("Timeout", SUPERVISION_TIMEOUT),
 )
@@ -583,21 +590,28 @@ def _key_file_integer(value: str) -> int | None:
     return int(match["number"]) & 0xFFFF
 
 
-def _allows_timeout(entries: dict[str, str]) -> bool:
+def _good_link(entries: dict[str, str]) -> bool:
+    """Whether the parameters BlueZ would load are valid, with a timeout of 2 s or more and
+    intervals of at most INTERVAL, or slower ones the key itself asked for: a minimum above ours
+    only comes from the key, and rewriting it would only make the key ask again."""
     values = [_key_file_integer(entries.get(key, "")) for key, _value in LINK_PARAMETERS]
     if any(value is None for value in values):
         return False
-    numbers = [value for value in values if value is not None]
-    return valid_link_parameters(*numbers) and numbers[3] >= SUPERVISION_TIMEOUT
+    minimum, maximum, latency, timeout = [value for value in values if value is not None]
+    return (
+        valid_link_parameters(minimum, maximum, latency, timeout)
+        and timeout >= MIN_SUPERVISION_TIMEOUT
+        and (maximum <= INTERVAL or minimum > INTERVAL)
+    )
 
 
 def with_link_parameters(text: str) -> str | None:
-    """`text`, a BlueZ device settings file, with connection parameters that give the key
-    SUPERVISION_TIMEOUT; None if the ones it has already do. Only that group changes: every
+    """`text`, a BlueZ device settings file, with LINK_PARAMETERS for the key; None if the
+    parameters it has are already as good (_good_link). Only that group changes: every
     other line, the bond's keys among them, stays as it is. ValueError if the result would not
     read back that way."""
     entries = link_parameters(text)
-    if entries is not None and _allows_timeout(entries):
+    if entries is not None and _good_link(entries):
         return None
     ours = [f"{key}={value}\n" for key, value in LINK_PARAMETERS]
     if entries is None:
@@ -618,7 +632,7 @@ def with_link_parameters(text: str) -> str | None:
             if index == first:
                 kept.extend(ours)
         new = "".join(kept)
-    if _outside_link_group(new) != _outside_link_group(text) or not _allows_timeout(
+    if _outside_link_group(new) != _outside_link_group(text) or not _good_link(
         link_parameters(new) or {}
     ):
         raise ValueError("the edited file would not read back as intended")
@@ -1182,8 +1196,8 @@ class Setup:
         return True
 
     def link(self, address: str) -> bool:
-        """Part of step 3: give the key's connections SUPERVISION_TIMEOUT in BlueZ's settings
-        for it. True if Bluetooth was restarted for that, which the bridge must follow."""
+        """Part of step 3: give the key's connections LINK_PARAMETERS in BlueZ's settings for
+        it. True if Bluetooth was restarted for that, which the bridge must follow."""
         path = self.bond_file
         try:
             # Bytes, decoded so that they encode back unchanged: no newline translation, and
@@ -1196,7 +1210,9 @@ class Setup:
         seconds = f"{SUPERVISION_TIMEOUT / 100:g} s"
         if path is None or text is None:
             self.say("  BlueZ keeps no settings file for the key where setup looks, so its")
-            self.say("  connections keep the default supervision timeout of 0.42 s.")
+            self.say(
+                "  connections keep the default timing (30 to 50 ms intervals, 0.42 s timeout)."
+            )
             return False
         try:
             new = with_link_parameters(text)
@@ -1206,15 +1222,16 @@ class Setup:
                 "README's manual setup), or leave it."
             ) from exc
         if new is None:
-            self.say(f"  The key's connections already allow {seconds} without radio contact.")
+            self.say("  The key's connection timing is already set.")
             return False
-        self.say("  By default Linux ends a Bluetooth LE connection after 0.42 s without radio")
-        self.say("  contact, so a key that pauses longer, busy or a few metres away, drops a login")
-        self.say(f"  midway. BlueZ can allow the key {seconds} instead ({path});")
-        self.say("  it reads that when it starts.")
+        self.say("  By default Linux talks to a Bluetooth LE device every 30 to 50 ms and ends the")
+        self.say("  connection after 0.42 s without radio contact. A login waits for some thirty")
+        self.say("  exchanges with the key, and a key that pauses longer, busy or a few metres")
+        self.say("  away, drops it midway. BlueZ can use 20 ms and allow")
+        self.say(f"  {seconds} for the key instead ({path}); it reads that when it starts.")
         if not confirm(
             self.console,
-            f"  Allow {seconds} and restart Bluetooth now? (Bluetooth devices reconnect by "
+            "  Use these for the key and restart Bluetooth now? (Bluetooth devices reconnect by "
             "themselves.)",
             default=False,
         ):
@@ -1230,11 +1247,11 @@ class Setup:
         )
         self.changes.append(
             Change(
-                f"allowed the key {seconds} without radio contact in {path}",
+                f"set the key's connection interval (20 ms) and timeout ({seconds}) in {path}",
                 f"{restore}, then sudo systemctl restart bluetooth",
             )
         )
-        self.say(f"  Allowed {seconds} in {path}.")
+        self.say(f"  Set them in {path}.")
         result = self.runner.run(["systemctl", "restart", "bluetooth"])
         if not result.ok:
             details = _first_line(result.stderr) or "no details"
