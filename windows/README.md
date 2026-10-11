@@ -25,7 +25,10 @@ lock screen ──► Fido2BleLogon tile ──BLE, CTAP2──► key: checks y
 - The .NET 10 SDK; setup offers to install it with winget
 
 Tested with a **Feitian AllinPass K33** on Windows 11. Other keys that meet the requirements
-should work; please report models you try.
+should work; please report models you try. The same K33 also works with the
+[Linux bridge](../linux/README.md) on another computer: it keeps a pairing with each, but
+connects to one at a time. For Windows and Linux on the same PC (dual boot), see
+[Dual-boot with Windows](../linux/README.md#dual-boot-with-windows).
 
 ## Setup
 
@@ -120,8 +123,9 @@ See [../SECURITY.md](../SECURITY.md#windows) for the threat model.
 - **Uninstall** (elevated): `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\uninstall.ps1`
   (add `-RemoveData` to delete the enrollment too).
 - The tile's log: `C:\ProgramData\Fido2BleLogon\logs\provider.log` (readable by administrators).
-- **Couldn't reach your security key:** the key may be connected to another device (a phone, for
-  example); a connected key doesn't advertise. Turn Bluetooth off there.
+- **Couldn't reach your security key:** the key may be connected to another device (a phone, or
+  another computer it is paired with, such as one running the Linux bridge); a connected key
+  doesn't advertise. Turn Bluetooth off there.
 
 ## Command reference
 

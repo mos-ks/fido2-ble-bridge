@@ -18,8 +18,10 @@ reports that key as bonded, and it relays CTAP2 messages unchanged. To install i
 `sudo ./install.sh` in `linux/`; its guided setup pairs the key, registers it for your account,
 tests a login and then enables the key for logins. It asks before it installs packages, pairs or
 uses a key (you type `yes` after seeing which device), removes or replaces a pairing or
-registration, sets a PIN or enrolls a finger, and enables PAM, and at the end it lists every
-change with its undo.
+registration, sets a PIN or enrolls a finger, gives the key's Bluetooth connections a longer
+timeout (which restarts Bluetooth), and enables PAM, and at the end it lists every change with
+its undo. At a login or `sudo`, a hint tells you to wake the key; the password prompt follows
+only when the key fails or is not reached.
 
 **Security.** The bridge is only a transport and cannot log anyone in. `pam_u2f` sends a fresh
 challenge, the key signs it with a private key that never leaves the key, and `pam_u2f`
@@ -29,7 +31,8 @@ succeed. The recommended setup requires the fingerprint (`userverification=1`). 
 profile uses the key for the login and lock screens, and for `sudo` and the console's `login`
 only when a check finds the request comes from your own session at this computer; never for
 `sshd`, for `sudo` in an SSH session, or for `su` and polkit, which would let another user start
-a login as you and make your key ask. The service runs in a strict systemd sandbox. Other local
+a login as you and make your key ask (polkit can be added behind the same check; see the Linux
+guide). The service runs in a strict systemd sandbox. Other local
 processes can still talk to a bonded key through BlueZ, as with any BLE key on Linux; each
 signature still needs the fingerprint, and what the key signs for them cannot log anyone in.
 [SECURITY.md](SECURITY.md) has the threat model and the hardening list.
@@ -55,15 +58,17 @@ key's PIN counts like a fingerprint, so use a strong key PIN and turn on device 
 ## Tested hardware
 
 - **Linux:** confirmed on a Feitian AllinPass K33 with Ubuntu 24.04 (ARM64, BlueZ 5.72):
-  pairing, registration and a fingerprint login through `pam_u2f`. The K33 keeps bonds with two
-  computers, but only one can be connected at a time. The test suite also runs end to end
-  through the real kernel (`uhid`, hidraw), libfido2, `pamu2fcfg` and `pam_u2f` with only the
-  Bluetooth radio simulated. If you try another key, please report the model as described in
+  pairing, registration, and fingerprint logins through `pam_u2f` at the login screen, for
+  `sudo` and, with `polkit-1` added to the profile, for `pkexec`. The test suite also runs end
+  to end through the real kernel (`uhid`, hidraw), libfido2, `pamu2fcfg` and `pam_u2f` with only
+  the Bluetooth radio simulated. If you try another key, please report the model as described in
   [linux/README.md](linux/README.md#status).
 - **Windows:** confirmed on a Feitian AllinPass K33 with Windows 11 (local account): pairing,
   enrollment and fingerprint sign-in on the real lock screen. The tile is also covered by an offline
   self-test that drives it the way LogonUI does, and the core by unit tests against a simulated
   authenticator; see [windows/README.md](windows/README.md).
+- **Both:** one K33 can serve a Linux computer and a Windows computer: it keeps a pairing with
+  each but connects to one at a time, so turn Bluetooth off on the computer you are not using.
 
 ## Reporting security issues
 

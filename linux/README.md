@@ -187,7 +187,11 @@ On top of that:
   the profile's own `pam_u2f` line worked, tests the PAM line outside `/etc/pam.d` before
   enabling anything, refuses a weakened profile, never edits PAM files itself (only
   `pam-auth-update` does, never with `--force`), never writes a config that fails validation,
-  and never logs passkeys or registration data.
+  and never logs passkeys or registration data. When it gives the key a longer supervision
+  timeout, it changes only the `[ConnectionParameters]` group of BlueZ's settings file for the
+  key, reads that file exactly as GLib does (so a device name or alias that another local user
+  chose cannot make it split a line), and refuses any edit that would change another line,
+  the bond's keys among them.
 
 What it does **not** protect against:
 
@@ -602,9 +606,16 @@ the service after editing (`sudo systemctl restart fido2-ble-bridge`).
 - `check` says **does not offer FIDO2 over BLE**: the key has no FIDO2 BLE service, or only
   legacy U2F over BLE, which this bridge does not support.
 - `check` times out: wake the key and make sure it is not connected to another device (a
-  phone, for example) or to this computer through the desktop's Bluetooth settings. A
-  connected key does not advertise, so the bridge cannot find it. If the key was reset or
-  paired with another computer since, its pairing here is stale: remove it and run setup again.
+  phone, or another computer it is paired with) or to this computer through the desktop's
+  Bluetooth settings. A connected key does not advertise, so the bridge cannot find it. Keys
+  such as the K33 keep pairings with several computers but connect to one at a time: turn
+  Bluetooth off on the other one. If the key was reset since it was paired here, its pairing
+  here is stale: remove it and run setup again.
+- `check` or setup says **initialization fragment while a frame was incomplete**: every
+  notification from the key arrived twice, because two programs on this computer had it
+  subscribed at the same moment (BlueZ sends a copy per subscriber), for example setup while
+  the bridge still held its link from a login. Wait 10 seconds (`idle_disconnect`) and try
+  again.
 - `check` says BlueZ **kept refusing to scan** (`org.bluez.Error.InProgress`), and
   `bluetoothctl scan le` fails the same way while `bluetoothctl show` reports `Discovering: no`:
   the Bluetooth controller is stuck, and the kernel log (`journalctl -k`) repeats

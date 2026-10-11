@@ -53,8 +53,11 @@ built-in verification no secret ever crosses the bridge.
 - The PAM profile uses the key only for the services it lists (`pam_succeed_if service in …`):
   login and lock screens, and `sudo`, `sudo -i` and `login` behind the local-session check
   (`pam_exec`), which skips the key for remote or seatless sessions, for another account's
-  session, and whenever it cannot tell. `su`, `su-l`, `polkit-1` and `sshd` are not listed.
-  `install.sh` re-applies an enabled profile when it changes, and warns when it cannot.
+  session, and whenever it cannot tell. `su`, `su-l`, `polkit-1` and `sshd` are not listed
+  (the README shows how to add `polkit-1` behind the check, never without it). A hint before
+  `pam_u2f` (`pam_exec` running `/usr/bin/echo`) is `[default=ignore]`, so it cannot change the
+  result. `install.sh` re-applies an enabled profile when it changes, keeps one an admin edited,
+  and warns when it cannot apply it.
 - No request reaches the key twice: on a kept-open link only getInfo is ever sent again, and
   only when the key acknowledged none of it; any other request on a link idle for over a second
   goes only after a BLE PING with a random payload was echoed, and then exactly once.
@@ -62,8 +65,10 @@ built-in verification no secret ever crosses the bridge.
   link so a late reply cannot answer the next request.
 - CTAP2 only; CTAPHID_MSG (U2F) is refused.
 - Every message is bounded by the CTAPHID maximum of 7609 bytes in both directions; outgoing BLE
-  fragments by the control point length and the ATT MTU. Out-of-sequence or oversized frames,
-  or a notification flood, drop the link.
+  fragments are as long as the key's `fidoControlPointLength` (some keys refuse shorter ones;
+  BlueZ turns a write longer than the ATT MTU into a long write). Out-of-sequence or oversized
+  frames, or a notification flood, drop the link. A link the key dropped is still released, so
+  BlueZ does not keep a stale notification subscription that would double every notification.
 - Message contents are never logged, and `bleak`/`dbus-fast` debug output (which would include
   raw GATT payloads) stays off even with `-v`.
 - systemd sandbox: a dedicated unprivileged system user, empty capability set, `PrivateNetwork`, `PrivateDevices` (a
@@ -84,7 +89,11 @@ built-in verification no secret ever crosses the bridge.
   `openasuser`, `expand` or unknown options. A new registration replaces all of the user's
   authfile lines, since `pam_u2f` reads only the last. Setup changes PAM only through
   `pam-auth-update` and never with `--force`, never retries a fingerprint request, and stops at
-  Ctrl-C during the login test.
+  Ctrl-C during the login test. To give the key a 5 s supervision timeout it edits BlueZ's
+  settings file for the key (which holds the bond's long-term key) only after you agree: it
+  touches only the `[ConnectionParameters]` group, reads the file the way GLib does so that a
+  device alias another user set cannot fake a group or split a line, refuses an edit that would
+  change any other line, writes atomically with mode 0600, and records the undo.
 - Restricting BlueZ's D-Bus API to the `bluetooth` group, which closes direct access to the key
   and pairing changes by other users, is documented (README: Restricting BlueZ to the bluetooth
   group) but not done by setup, because it takes Bluetooth away from accounts outside the group.
