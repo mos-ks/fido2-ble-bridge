@@ -157,6 +157,16 @@ async def test_unknown_ble_error_code_maps_to_other() -> None:
     await link.close()
 
 
+async def test_a_key_waiting_silently_for_its_user_is_not_given_up_on() -> None:
+    connector = SimulatedConnector(SoftAuthenticator(user_wait=1.0), keepalive_once=True)
+    link = make_link(connector, silence_timeout=0.2)
+    keepalives: list[int] = []
+    # The key answers after the 1 s wait, five times the silence timeout.
+    assert isinstance(await ask(link, assertion_request(), keepalives=keepalives), MsgResponse)
+    assert keepalives == [2]
+    await link.close()
+
+
 async def test_silent_authenticator_drops_the_link() -> None:
     connector = SimulatedConnector(silent=True)
     link = make_link(connector)

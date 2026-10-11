@@ -363,9 +363,13 @@ class FidoBleLink:
     ) -> Response:
         loop = asyncio.get_running_loop()
         cancel_deadline: float | None = None
+        awaiting_user = False
         while True:
             if cancel_deadline is None:
-                event = await self._next_event(cancelled, self._silence_timeout)
+                # A key waiting for its user may say so once and then stay silent until touched
+                # (a Feitian AllinPass K33 does); request()'s deadline still bounds that wait.
+                silence = None if awaiting_user else self._silence_timeout
+                event = await self._next_event(cancelled, silence)
             else:
                 # Absolute: keepalives after a CANCEL must not extend the wait.
                 event = await self._next_event(None, max(0.0, cancel_deadline - loop.time()))
@@ -387,6 +391,7 @@ class FidoBleLink:
             if event.cmd == BleCmd.KEEPALIVE:
                 if len(event.data) == 1 and event.data[0] in _KEEPALIVE_STATUSES:
                     on_keepalive(event.data[0])
+                    awaiting_user = event.data[0] == KeepaliveStatus.UPNEEDED
                 continue
             if event.cmd == BleCmd.MSG:
                 return MsgResponse(event.data)
@@ -396,7 +401,7 @@ class FidoBleLink:
             raise LinkError(f"unexpected frame command 0x{event.cmd:02x}")
 
     async def _next_event(
-        self, cancelled: asyncio.Event | None, timeout: float
+        self, cancelled: asyncio.Event | None, timeout: float | None
     ) -> _Event | _CancelRequested | None:
         if cancelled is not None and cancelled.is_set():
             return _CANCEL_REQUESTED

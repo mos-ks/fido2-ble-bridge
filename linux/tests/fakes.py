@@ -197,6 +197,7 @@ class SimulatedFidoKey:
         silent: bool = False,
         disconnect_mid_request: bool = False,
         keepalive_forever: bool = False,
+        keepalive_once: bool = False,
         hang_writes: bool = False,
         hang_disconnect: bool = False,
         ignore_cancel: bool = False,
@@ -215,6 +216,8 @@ class SimulatedFidoKey:
         self.silent = silent
         self.disconnect_mid_request = disconnect_mid_request
         self.keepalive_forever = keepalive_forever
+        self.keepalive_once = keepalive_once
+        """While waiting for the user, send one UP_NEEDED keepalive and then nothing (the K33)."""
         self.hang_writes = hang_writes
         self.hang_disconnect = hang_disconnect
         self.ignore_cancel = ignore_cancel
@@ -336,7 +339,10 @@ class SimulatedFidoKey:
         if self.responder is not None:
             self.send_frame(0x83, self.responder(data))
             return
-        if self.authenticator.needs_user(data):
+        if self.authenticator.needs_user(data) and self.keepalive_once:
+            self.send_frame(0x82, b"\x02")
+            await asyncio.sleep(self.authenticator.user_wait)
+        elif self.authenticator.needs_user(data):
             waited = 0.0
             while waited < self.authenticator.user_wait:
                 self.send_frame(0x82, b"\x02")
