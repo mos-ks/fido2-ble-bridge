@@ -27,6 +27,7 @@ from fido2_ble_bridge.uhid import BRIDGE_PHYS
 
 PROJECT = Path(__file__).resolve().parents[1]
 ADAPTER_PATH = "/org/bluez/hci0"
+ADAPTER_ADDRESS = "AA:BB:CC:00:00:01"
 ADAPTER = "org.bluez.Adapter1"
 DEVICE = "org.bluez.Device1"
 NODE = "/dev/hidraw5"
@@ -44,6 +45,7 @@ _SIGNATURES = {
     "RSSI": "n",
     "Powered": "b",
     "Pairable": "b",
+    "AddressType": "s",
 }
 
 
@@ -56,7 +58,14 @@ class FakeBluez:
 
     def __init__(self, *, powered: bool = True, pairable: bool = True) -> None:
         self.objects: dict[str, dict[str, dict[str, Any]]] = {
-            ADAPTER_PATH: {ADAPTER: {"Powered": powered, "Pairable": pairable}}
+            ADAPTER_PATH: {
+                ADAPTER: {
+                    "Address": ADAPTER_ADDRESS,
+                    "AddressType": "public",
+                    "Powered": powered,
+                    "Pairable": pairable,
+                }
+            }
         }
         self.calls: list[tuple[str, str]] = []
         """(member, object path) of every method call, in order."""
@@ -444,6 +453,7 @@ def healthy_runner(paths: Paths, state: SystemState) -> FakeRunner:
     runner.on("systemctl", "is-active", "--quiet", "fido2-ble-bridge", result=is_active)
     runner.on("systemctl", "enable", "--now", "fido2-ble-bridge", result=enable_now)
     runner.on("systemctl", "restart", "fido2-ble-bridge", result=enable_now)
+    runner.on("systemctl", "restart", "bluetooth", result=ok)
     runner.on("systemctl", "stop", "fido2-ble-bridge", result=stop)
     runner.on("systemctl", "start", "fido2-ble-bridge", result=start)
     runner.on("fido2-token", "-I", result=Completed(0, token_info()))

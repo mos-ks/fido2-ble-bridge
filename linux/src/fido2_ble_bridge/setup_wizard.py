@@ -60,6 +60,18 @@ PAM_TEST_SERVICE = "fido2-ble-bridge-setup-test"
 MIN_BLUEZ = (5, 65)  # Device1.Bonded, which the bridge's bond check needs
 MIN_SYSTEMD = 253  # OpenFile=, which hands the sandboxed service /dev/uhid
 STEPS = 8
+BLUEZ_STORAGE = "/var/lib/bluetooth"
+# The key's LE connection parameters, as BlueZ keeps them in its settings file for the key and
+# loads them into the kernel when bluetoothd starts (intervals in 1.25 ms, timeout in 10 ms).
+# The kernel's own defaults, except for the supervision timeout: 5 s instead of 0.42 s, which a
+# key that pauses its radio a little longer, busy or a few metres away, misses mid-login.
+SUPERVISION_TIMEOUT = 500
+LINK_PARAMETERS = (
+    ("MinInterval", 24),
+    ("MaxInterval", 40),
+    ("Latency", 0),
+    ("Timeout", SUPERVISION_TIMEOUT),
+)
 
 # Package names per distribution family: the install command, then requirement -> package.
 PACKAGES: dict[str, tuple[str, dict[str, str]]] = {
@@ -105,6 +117,9 @@ address = "{address}"
 _T = TypeVar("_T")
 _ADDRESS_LINE = re.compile(r"^[ \t]*address[ \t]*=.*$", re.MULTILINE)
 _ADAPTER_LINE = re.compile(r"^[ \t]*adapter[ \t]*=.*$", re.MULTILINE)
+_BT_ADDRESS = re.compile(r"[0-9A-F]{2}(:[0-9A-F]{2}){5}")
+_KEY_FILE_GROUP = re.compile(r"\s*\[(?P<name>[^\]]*)\]\s*")
+_KEY_FILE_ENTRY = re.compile(r"\s*(?P<key>[A-Za-z0-9-]+)\s*=\s*(?P<value>.*?)\s*")
 
 
 class SetupError(Exception):
@@ -136,6 +151,8 @@ class Timing:
     pair: float = 60.0
     wake: float = 30.0
     """Seconds the key check waits for the key to be woken."""
+    bluetooth: float = 20.0
+    """Seconds to wait for BlueZ to list the key again after restarting it."""
     node: float = 15.0
     """Seconds to wait for the virtual hidraw device after starting the service."""
 
@@ -496,6 +513,76 @@ def write_file(path: Path, text: str, mode: int = 0o644) -> None:
         raise
 
 
+def valid_link_parameters(min_interval: int, max_interval: int, latency: int, timeout: int) -> bool:
+    """The kernel's checks (hci_check_conn_params): BlueZ loads whatever its settings file
+    says, and the kernel ignores parameters that fail them."""
+    if not 6 <= min_interval <= max_interval <= 3200 or not 10 <= timeout <= 3200:
+        return False
+    if max_interval >= timeout * 8:
+        return False
+    return 0 <= latency <= 499 and latency <= timeout * 4 // max_interval - 1
+
+
+def _key_file_lines(text: str) -> tuple[list[str], int | None, int]:
+    """`text`'s lines, and where its [ConnectionParameters] group starts (the header's index,
+    None if absent) and ends (the next header's index, or the line count)."""
+    lines = text.splitlines(keepends=True)
+    headers = [
+        (index, match["name"])
+        for index, line in enumerate(lines)
+        if (match := _KEY_FILE_GROUP.fullmatch(line.rstrip("\r\n")))
+    ]
+    start = next((index for index, name in headers if name == "ConnectionParameters"), None)
+    end = next((index for index, _name in headers if start is not None and index > start), None)
+    return lines, start, len(lines) if end is None else end
+
+
+def link_parameters(text: str) -> dict[str, str] | None:
+    """The [ConnectionParameters] entries of a BlueZ device settings file (a GLib key file),
+    None if it has no such group."""
+    lines, start, end = _key_file_lines(text)
+    if start is None:
+        return None
+    return {
+        match["key"]: match["value"]
+        for line in lines[start + 1 : end]
+        if (match := _KEY_FILE_ENTRY.fullmatch(line.rstrip("\r\n")))
+    }
+
+
+def _allows_timeout(entries: dict[str, str]) -> bool:
+    try:
+        values = [int(entries[key]) for key, _value in LINK_PARAMETERS]
+    except (KeyError, ValueError):
+        return False
+    return valid_link_parameters(*values) and values[3] >= SUPERVISION_TIMEOUT
+
+
+def with_link_parameters(text: str) -> str | None:
+    """`text`, a BlueZ device settings file, with connection parameters that give the key
+    SUPERVISION_TIMEOUT; None if the ones it has already do. Only that group changes: the rest,
+    bond keys included, stays as it is, byte for byte."""
+    lines, start, end = _key_file_lines(text)
+    ours = [f"{key}={value}\n" for key, value in LINK_PARAMETERS]
+    if start is None:
+        group = "[ConnectionParameters]\n" + "".join(ours)
+        if not text:
+            return group
+        # A blank line between groups, as BlueZ writes them.
+        return text + ("\n" if text.endswith("\n") else "\n\n") + group
+    entries = link_parameters(text)
+    if entries is not None and _allows_timeout(entries):
+        return None
+    names = {key for key, _value in LINK_PARAMETERS}
+    kept = [
+        line
+        for line in lines[start + 1 : end]
+        if not ((match := _KEY_FILE_ENTRY.fullmatch(line.rstrip("\r\n"))) and match["key"] in names)
+    ]
+    header = lines[start] if lines[start].endswith("\n") else lines[start] + "\n"
+    return "".join([*lines[:start], header, *ours, *kept, *lines[end:]])
+
+
 def _first_line(text: str) -> str:
     return next((line.strip() for line in text.splitlines() if line.strip()), "")
 
@@ -529,6 +616,10 @@ class Setup:
         """Backup-key credentials (`:...`) for the user's line; not saved yet."""
         self.tested_profile: str | None = None
         """The PAM profile's text as step 7 tested its pam_u2f line; step 8 enables only that."""
+        self.key_adapter: str | None = None
+        """The adapter (hciN) that holds the key's bond, from step 2."""
+        self.bond_file: Path | None = None
+        """BlueZ's settings file for the key, from step 2; None if BlueZ did not say where."""
         self._loop: asyncio.Runner | None = None
 
     def say(self, text: str = "") -> None:
@@ -564,8 +655,9 @@ class Setup:
         current = self._read_config()
         address = self.pair(current)
         changed = self.configure(address, current, adapter=self.adapter)
+        restarted = self.link(address)
         config = load_config(self.paths.config)
-        self.service(config, config_changed=changed)
+        self.service(config, config_changed=changed or restarted)
         node = self.fingerprint(config)
         node = self.register(node, config.device_name)
         tested = self.test_login(node)
@@ -729,12 +821,21 @@ class Setup:
                         f"  This computer has {bluetooth.adapter_count} Bluetooth adapters; "
                         f"using {bluetooth.adapter}."
                     )
-                return self._pair_with(bluetooth, wanted, configured)
+                address = self._pair_with(bluetooth, wanted, configured)
+                self.key_adapter = bluetooth.adapter
+                self.bond_file = self._bond_file(bluetooth, address)
+                return address
             except BluetoothError as exc:
                 raise SetupError(f"Bluetooth: {exc}.") from exc
             finally:
                 bus.disconnect()
                 self._loop = None
+
+    def _bond_file(self, bluetooth: BluezPairing, address: str) -> Path | None:
+        directory = self._await(bluetooth.storage_dir())
+        if directory is None or not _BT_ADDRESS.fullmatch(address):
+            return None
+        return self.paths.at(f"{BLUEZ_STORAGE}/{directory}/{address}/info")
 
     def _await(self, coroutine: Coroutine[Any, Any, _T]) -> _T:
         if self._loop is None:
@@ -1028,6 +1129,92 @@ class Setup:
         if new_adapter is not None:
             self.say("  (The key is bonded on that adapter, so the bridge must use it too.)")
         return True
+
+    def link(self, address: str) -> bool:
+        """Part of step 3: give the key's connections SUPERVISION_TIMEOUT in BlueZ's settings
+        for it. True if Bluetooth was restarted for that, which the bridge must follow."""
+        path = self.bond_file
+        try:
+            text = path.read_text() if path is not None else None
+        except FileNotFoundError:
+            text = None
+        except OSError as exc:
+            raise SetupError(f"cannot read {path}: {exc.strerror}.") from exc
+        seconds = f"{SUPERVISION_TIMEOUT / 100:g} s"
+        if path is None or text is None:
+            self.say("  BlueZ keeps no settings file for the key where setup looks, so its")
+            self.say("  connections keep the default supervision timeout of 0.42 s.")
+            return False
+        new = with_link_parameters(text)
+        if new is None:
+            self.say(f"  The key's connections already allow {seconds} without radio contact.")
+            return False
+        self.say("  By default Linux ends a Bluetooth LE connection after 0.42 s without radio")
+        self.say("  contact, so a key that pauses longer, busy or a few metres away, drops a login")
+        self.say(f"  midway. BlueZ can allow the key {seconds} instead ({path});")
+        self.say("  it reads that when it starts.")
+        if not confirm(
+            self.console,
+            f"  Allow {seconds} and restart Bluetooth now? (Bluetooth devices reconnect by "
+            "themselves.)",
+            default=True,
+        ):
+            self.say("  Left as it is; run setup again to change it.")
+            return False
+        old = link_parameters(text)
+        write_file(path, new, mode=0o600)
+        restore = (
+            f"delete the [ConnectionParameters] group from {path}"
+            if old is None
+            else f"set [ConnectionParameters] in {path} back to "
+            + ", ".join(f"{key}={value}" for key, value in old.items())
+        )
+        self.changes.append(
+            Change(
+                f"allowed the key {seconds} without radio contact in {path}",
+                f"{restore}, then sudo systemctl restart bluetooth",
+            )
+        )
+        self.say(f"  Allowed {seconds} in {path}.")
+        result = self.runner.run(["systemctl", "restart", "bluetooth"])
+        if not result.ok:
+            details = _first_line(result.stderr) or "no details"
+            raise SetupError(
+                f"systemctl restart bluetooth failed: {details}. The setting takes effect once "
+                "Bluetooth restarts: sudo systemctl restart bluetooth"
+            )
+        self._wait_for_bluetooth(address)
+        self.say("  Restarted Bluetooth.")
+        return True
+
+    def _wait_for_bluetooth(self, address: str) -> None:
+        """After a restart of bluetoothd: until it lists the key's bond on a powered adapter."""
+        deadline = time.monotonic() + self.timing.bluetooth
+        with asyncio.Runner() as loop:
+            while not loop.run(self._bluetooth_ready(address)):
+                if time.monotonic() >= deadline:
+                    raise SetupError(
+                        f"BlueZ did not list the key again within {self.timing.bluetooth:g} s of "
+                        "restarting Bluetooth. See: systemctl status bluetooth; then run setup "
+                        "again."
+                    )
+                time.sleep(self.timing.poll)
+
+    async def _bluetooth_ready(self, address: str) -> bool:
+        try:
+            bus = await self.host.bus()
+        except BluetoothError:
+            return False
+        try:
+            bluetooth = await BluezPairing.open(bus, self.key_adapter, key=address)
+            if not await bluetooth.powered():
+                return False
+            devices = await bluetooth.devices()
+        except BluetoothError:
+            return False
+        finally:
+            bus.disconnect()
+        return any(device.address == address and device.has_bond for device in devices)
 
     # Step 4
 

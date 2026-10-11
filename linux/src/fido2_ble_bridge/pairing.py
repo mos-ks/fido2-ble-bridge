@@ -11,6 +11,7 @@ desktop's own agent is left alone. The agent answers only for the device being p
 
 import asyncio
 import contextlib
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, Self, TypeVar
@@ -41,6 +42,7 @@ ALREADY_EXISTS = "org.bluez.Error.AlreadyExists"
 BLOCKED = "org.bluez.Error.Blocked"
 SERVICE_UNKNOWN = "org.freedesktop.DBus.Error.ServiceUnknown"
 TIMED_OUT = "org.fido2_ble_bridge.Error.Timeout"  # ours: BlueZ did not answer in time
+_ADDRESS = re.compile(r"[0-9A-F]{2}(:[0-9A-F]{2}){5}")
 
 
 class BluetoothError(Exception):
@@ -344,6 +346,20 @@ class BluezPairing:
         (props,) = await self._call(self.adapter_path, PROPERTIES, "GetAll", "s", [ADAPTER])
         variant = props.get(name)
         return variant is not None and bool(variant.value)
+
+    async def storage_dir(self) -> str | None:
+        """The adapter's directory in BlueZ's storage (/var/lib/bluetooth), named as bluetoothd
+        names it: the adapter's address, after "static-" for a static random address. None if
+        BlueZ reports no usable address."""
+        (props,) = await self._call(self.adapter_path, PROPERTIES, "GetAll", "s", [ADAPTER])
+        address = str(getattr(props.get("Address"), "value", "")).upper()
+        if not _ADDRESS.fullmatch(address):
+            return None
+        static = getattr(props.get("AddressType"), "value", "public") == "random"
+        return f"static-{address}" if static else address
+
+    async def powered(self) -> bool:
+        return await self._adapter_flag("Powered")
 
     async def power_on(self) -> bool:
         """Turn the adapter on if it is off; True if it was off."""

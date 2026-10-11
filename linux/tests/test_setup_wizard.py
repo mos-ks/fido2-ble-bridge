@@ -12,6 +12,8 @@ import pytest
 from dbus_fast.errors import DBusError
 from fakes import SimulatedConnector
 from setup_fakes import (
+    ADAPTER_ADDRESS,
+    ADAPTER_PATH,
     KEY,
     MAPPING,
     NODE,
@@ -58,6 +60,8 @@ from fido2_ble_bridge.setup_wizard import (
     resolve_user,
     set_adapter,
     set_address,
+    valid_link_parameters,
+    with_link_parameters,
 )
 
 FAST = Timing(scan=0.3, settle=0.05, poll=0.01, pair=0.3, wake=1.0, node=0.1)
@@ -745,6 +749,199 @@ def test_a_configured_adapter_is_left_alone(world: World) -> None:
     setup = world.setup()
     assert setup.configure(KEY, load_config(world.paths.config), adapter="hci1") is False
     assert setup.changes == []
+
+
+# Step 3: the key's link
+
+# A device settings file as BlueZ 5.72 writes one, with made-up keys.
+BOND_INFO = """\
+[General]
+Name=FIDO2
+AddressType=static
+SupportedTechnologies=LE;
+Trusted=true
+Blocked=false
+Services=00001800-0000-1000-8000-00805f9b34fb;0000fffd-0000-1000-8000-00805f9b34fb;
+
+[LongTermKey]
+Key=00112233445566778899AABBCCDDEEFF
+Authenticated=0
+EncSize=16
+EDiv=0
+Rand=0
+"""
+LINK_GROUP = "[ConnectionParameters]\nMinInterval=24\nMaxInterval=40\nLatency=0\nTimeout=500\n"
+
+
+def bond_info(
+    paths: Paths, text: str | None = BOND_INFO, adapter_dir: str = ADAPTER_ADDRESS
+) -> Path:
+    path = paths.at(f"/var/lib/bluetooth/{adapter_dir}/{KEY}/info")
+    if text is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        path.chmod(0o600)
+    return path
+
+
+def paired_setup(world: World, *answers: str) -> Setup:
+    """A Setup whose step 2 found the bonded key; `answers` follow the one step 2 asks."""
+    world.bluez.add_device(KEY, paired=True, bonded=True, trusted=True)
+    world.answer("yes", *answers)
+    setup = world.setup()
+    assert setup.pair(config_for(KEY)) == KEY
+    return setup
+
+
+def test_the_key_gets_a_longer_supervision_timeout_after_asking(world: World) -> None:
+    world.answer("", "yes", "", "yes")
+    assert world.run() == 0
+    info = bond_info(world.paths)
+
+    # Use the bonded key; allow 5 s (Enter); keep the registration; no backup key.
+    world.answer("yes", "", "", "")
+    assert world.run() == 0
+    assert info.read_text() == BOND_INFO + "\n" + LINK_GROUP
+    assert stat.S_IMODE(info.stat().st_mode) == 0o600
+    # BlueZ reads the setting when it starts; the bridge follows BlueZ's restart.
+    assert world.runner.ran("systemctl", "restart") == [
+        ["systemctl", "restart", "bluetooth"],
+        ["systemctl", "restart", "fido2-ble-bridge"],
+    ]
+    assert any("restart Bluetooth now?" in prompt for prompt in world.console.prompts)
+    assert (
+        f"undo: delete the [ConnectionParameters] group from {info}, then sudo systemctl "
+        "restart bluetooth" in world.console.text
+    )
+    assert world.console.answers == []
+
+
+def test_declining_leaves_the_settings_and_bluetooth_alone(world: World) -> None:
+    info = bond_info(world.paths)
+    setup = paired_setup(world, "n")
+    assert setup.link(KEY) is False
+    assert info.read_text() == BOND_INFO
+    assert world.runner.ran("systemctl", "restart") == []
+    assert setup.changes == []
+
+
+def test_parameters_that_already_allow_the_timeout_are_kept_without_asking(world: World) -> None:
+    text = BOND_INFO + "\n[ConnectionParameters]\nMinInterval=6\nMaxInterval=12\nLatency=4\n"
+    info = bond_info(world.paths, text + "Timeout=600\n")
+    setup = paired_setup(world)
+    assert setup.link(KEY) is False
+    assert info.read_text() == text + "Timeout=600\n"
+    assert "already allow 5 s" in world.console.text
+    assert world.runner.ran("systemctl", "restart") == []
+
+
+def test_parameters_the_key_asked_for_are_replaced_and_their_undo_recorded(world: World) -> None:
+    group = "[ConnectionParameters]\nMinInterval=12\nMaxInterval=24\nLatency=0\nTimeout=42\n"
+    info = bond_info(world.paths, BOND_INFO + "\n" + group)
+    setup = paired_setup(world, "y")
+    assert setup.link(KEY) is True
+    assert info.read_text() == BOND_INFO + "\n" + LINK_GROUP
+    assert [change.undo for change in setup.changes] == [
+        f"set [ConnectionParameters] in {info} back to MinInterval=12, MaxInterval=24, "
+        "Latency=0, Timeout=42, then sudo systemctl restart bluetooth"
+    ]
+
+
+def test_without_bluez_settings_for_the_key_its_link_is_left_alone(world: World) -> None:
+    setup = paired_setup(world)
+    assert setup.link(KEY) is False
+    assert "keep the default supervision timeout of 0.42 s" in world.console.text
+    assert world.console.answers == []
+    assert world.runner.ran("systemctl", "restart") == []
+
+
+def test_an_adapter_with_a_static_address_keeps_its_settings_under_static(world: World) -> None:
+    world.bluez.objects[ADAPTER_PATH]["org.bluez.Adapter1"]["AddressType"] = "random"
+    info = bond_info(world.paths, adapter_dir=f"static-{ADAPTER_ADDRESS}")
+    setup = paired_setup(world, "")
+    assert setup.bond_file == info
+    assert setup.link(KEY) is True
+    assert info.read_text().endswith(LINK_GROUP)
+
+
+def test_a_failed_bluetooth_restart_says_how_to_apply_the_setting(world: World) -> None:
+    world.runner.on("systemctl", "restart", "bluetooth", result=Completed(1, "", "Failed.\n"))
+    info = bond_info(world.paths)
+    setup = paired_setup(world, "")
+    with pytest.raises(SetupError, match="takes effect once Bluetooth restarts"):
+        setup.link(KEY)
+    assert info.read_text().endswith(LINK_GROUP)
+    assert len(setup.changes) == 1
+
+
+def test_bluez_that_does_not_list_the_key_again_stops_setup(world: World) -> None:
+    bond_info(world.paths)
+    setup = paired_setup(world, "")
+    setup.timing = dataclasses.replace(FAST, bluetooth=0.05)
+
+    def restart_without_the_key(_argv: list[str]) -> Completed:
+        del world.bluez.objects[device_path(KEY)]
+        return Completed(0)
+
+    world.runner.on("systemctl", "restart", "bluetooth", result=restart_without_the_key)
+    with pytest.raises(SetupError, match="did not list the key again"):
+        setup.link(KEY)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("", LINK_GROUP),
+        ("[General]\nName=K\n", "[General]\nName=K\n\n" + LINK_GROUP),
+        ("[General]\nName=K", "[General]\nName=K\n\n" + LINK_GROUP),
+        # A header at the end of the file without a newline.
+        ("[General]\nName=K\n[ConnectionParameters]", "[General]\nName=K\n" + LINK_GROUP),
+        # Other entries and comments in the group stay; every copy of ours goes.
+        (
+            "[ConnectionParameters]\n# kept\nTimeout=1\nOther=x\nTimeout=2\n\n"
+            "[LongTermKey]\nKey=0\n",
+            LINK_GROUP + "# kept\nOther=x\n\n[LongTermKey]\nKey=0\n",
+        ),
+        # Values BlueZ reads as 0 (not numbers) and a group the kernel would ignore.
+        (
+            "[ConnectionParameters]\nMinInterval=x\nMaxInterval=40\nLatency=0\nTimeout=500\n",
+            LINK_GROUP,
+        ),
+        (
+            "[ConnectionParameters]\nMinInterval=24\nMaxInterval=40\nLatency=60\nTimeout=500\n",
+            LINK_GROUP,
+        ),
+    ],
+)
+def test_link_parameters_change_only_their_group(text: str, expected: str) -> None:
+    assert with_link_parameters(text) == expected
+
+
+def test_usable_link_parameters_are_left_as_they_are() -> None:
+    assert with_link_parameters(LINK_GROUP) is None
+    assert with_link_parameters("[A]\n" + LINK_GROUP.replace("500", "3200") + "[B]\n") is None
+
+
+@pytest.mark.parametrize(
+    ("parameters", "valid"),
+    [
+        ((24, 40, 0, 500), True),
+        ((24, 40, 0, 42), True),
+        ((5, 40, 0, 500), False),  # interval below 7.5 ms
+        ((41, 40, 0, 500), False),  # min above max
+        ((24, 3201, 0, 3200), False),  # interval above 4 s
+        ((24, 40, 0, 9), False),  # timeout below 100 ms
+        ((24, 40, 0, 3201), False),  # timeout above 32 s
+        ((24, 400, 0, 50), False),  # timeout not above twice the interval
+        ((24, 40, 49, 500), True),
+        ((24, 40, 50, 500), False),  # latency the timeout cannot cover
+        ((24, 24, 500, 3200), False),  # latency above 499
+    ],
+)
+def test_link_parameters_are_checked_as_the_kernel_checks_them(
+    parameters: tuple[int, int, int, int], valid: bool
+) -> None:
+    assert valid_link_parameters(*parameters) is valid
 
 
 # Step 4: service and key check

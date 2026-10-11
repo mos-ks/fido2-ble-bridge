@@ -49,7 +49,10 @@ can stop at any point (Ctrl-C) and run it again:
    [the security model](#security-model)). An existing pairing is only removed after you agree.
 3. **Configuration.** It writes the key's address into `/etc/fido2-ble-bridge/config.toml`,
    keeping your other settings and comments. On a computer with several Bluetooth adapters it
-   also writes the one the key is bonded on.
+   also writes the one the key is bonded on. Then, after asking, it lets the key's connections
+   go 5 seconds without radio contact instead of Linux's default 0.42 s, in BlueZ's settings
+   for the key (the `[ConnectionParameters]` group of
+   `/var/lib/bluetooth/<adapter>/<key>/info`), and restarts Bluetooth so that BlueZ loads it.
 4. **Service.** It enables and starts the bridge, then checks the key over Bluetooth. Wake the
    key when asked (a short press).
 5. **Fingerprint.** It finds the bridge's virtual device (by its name, bus and `phys`, and only
@@ -322,6 +325,29 @@ $ fido2-token -L                     # the bridge shows up as a USB FIDO device
 $ fido2-token -I /dev/hidraw5        # with the key awake: its real getInfo
 ```
 
+Linux ends a Bluetooth LE connection after 0.42 s without radio contact, and a key that pauses
+longer, busy or a few metres away, then drops a login midway. BlueZ loads longer limits for one
+device from its settings file when it starts. Add this group to the key's file (or change the
+values, if the file has the group already):
+
+```ini
+[ConnectionParameters]
+MinInterval=24
+MaxInterval=40
+Latency=0
+Timeout=500
+```
+
+```console
+$ sudo ls /var/lib/bluetooth/        # your adapter's address
+$ sudoedit /var/lib/bluetooth/<adapter>/AA:BB:CC:DD:EE:FF/info
+$ sudo systemctl restart bluetooth   # Bluetooth devices reconnect by themselves
+```
+
+The intervals are Linux's defaults (30 to 50 ms, in units of 1.25 ms); `Timeout` is in units of
+10 ms. BlueZ keeps the group until the pairing is removed, or until the key asks for parameters
+of its own.
+
 ### 3. Fingerprint
 
 If the key has no fingerprint enrolled yet, you can enroll one through the bridge. A PIN must
@@ -574,6 +600,11 @@ the service after editing (`sudo systemctl restart fido2-ble-bridge`).
   the Bluetooth controller is stuck, and the kernel log (`journalctl -k`) repeats
   `Opcode 0x2041 failed: -16` and `start background scanning failed: -16`. Logins cannot reach
   the key until the adapter is reset: `bluetoothctl power off`, then `bluetoothctl power on`.
+- Logins sometimes fall back to the password, and the journal says **`authenticator
+  disconnected`** in the middle of a request: the connection was lost. When `sudo btmon` shows
+  `Disconnect Complete` with `Reason: Connection Timeout (0x08)` (the kernel log may add `ACL
+  packet for unknown connection handle`), the key went quiet longer than the supervision
+  timeout. Run setup again and allow 5 s in step 3, or see [Manual setup](#2-configure-and-check).
 - Setup's **login test fails**: nothing was saved, so `/etc/fido2-ble-bridge/u2f_mappings` and
   PAM are as they were, and an earlier registration still works. Check the enrolled finger
   before trying again (`fido2-token -I /dev/hidrawN` must list `uv`).
