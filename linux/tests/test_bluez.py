@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 import pytest
@@ -15,6 +16,7 @@ from fido2_ble_bridge.bluez import (
     connect_with_retry,
     device_path_for,
     scan_fido_devices,
+    wait_for_advertisement,
 )
 
 
@@ -58,6 +60,70 @@ async def test_connect_gives_up_at_the_deadline(monkeypatch: pytest.MonkeyPatch)
     errors = ["org.bluez.Error.InProgress"] * 1000
     with pytest.raises(KeyNotReachable, match="InProgress"):
         await connect_with_retry(lambda t: _Client(errors, [], t), 0.2)  # type: ignore[arg-type,return-value]
+
+
+class _Scanner:
+    """Fake BleakScanner: start() may be refused; once started, `address` advertises after
+    `advertise_after` seconds (never if None)."""
+
+    def __init__(self, callback: Any, script: dict[str, Any]) -> None:
+        self._callback = callback
+        self._script = script
+        self._task: asyncio.Task[None] | None = None
+
+    async def start(self) -> None:
+        self._script["starts"] += 1
+        if self._script["refusals"]:
+            self._script["refusals"] -= 1
+            raise BleakDBusError("org.bluez.Error.InProgress", ["Operation already in progress"])
+        self._script["running"] += 1
+        delay = self._script["advertise_after"]
+        if delay is not None:
+            self._task = asyncio.create_task(self._advertise(delay))
+
+    async def _advertise(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        self._callback(BLEDevice(self._script["address"].lower(), None, {}), None)
+
+    async def stop(self) -> None:
+        await asyncio.sleep(0.01)
+        self._script["running"] -= 1
+        if self._task is not None:
+            self._task.cancel()
+
+
+def _script(**overrides: Any) -> dict[str, Any]:
+    script = {"address": "AA:BB", "refusals": 0, "advertise_after": 0.01, "starts": 0, "running": 0}
+    script.update(overrides)
+    return script
+
+
+async def test_scan_waits_for_the_key_and_always_stops(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bluez, "SCAN_RETRY_DELAY", 0.01)
+    script = _script(refusals=2)
+    await wait_for_advertisement(lambda cb: _Scanner(cb, script), "AA:BB", 5)  # type: ignore[arg-type,return-value]
+    assert script["starts"] == 3  # two refused starts were retried
+    assert script["running"] == 0
+
+
+async def test_scan_times_out_when_the_key_stays_asleep() -> None:
+    script = _script(advertise_after=None)
+    with pytest.raises(KeyNotReachable, match="did not advertise"):
+        await wait_for_advertisement(lambda cb: _Scanner(cb, script), "AA:BB", 0.1)  # type: ignore[arg-type,return-value]
+    assert script["running"] == 0
+
+
+async def test_scan_is_stopped_even_when_the_wait_is_cancelled() -> None:
+    script = _script(advertise_after=None)
+    waiter = asyncio.create_task(
+        wait_for_advertisement(lambda cb: _Scanner(cb, script), "AA:BB", 5)  # type: ignore[arg-type,return-value]
+    )
+    await asyncio.sleep(0.05)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    await asyncio.sleep(0.05)  # the shielded stop finishes after the cancellation
+    assert script["running"] == 0
 
 
 async def test_connect_does_not_retry_other_errors() -> None:

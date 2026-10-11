@@ -208,20 +208,68 @@ async def connect_with_retry(
             await asyncio.sleep(CONNECT_RETRY_DELAY)
 
 
+SCAN_RETRY_DELAY = 0.5
+
+
+async def wait_for_advertisement(
+    make_scanner: Callable[[Callable[[BLEDevice, Any], None]], BleakScanner],
+    address: str,
+    timeout: float,
+) -> None:
+    """Scans until `address` advertises (a sleeping key does once it is woken), within `timeout`.
+
+    BlueZ refuses a new scan from a client whose earlier scan is still running (InProgress), so
+    the scan is always stopped, even when the caller is cancelled, and a refused start is retried.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    seen = asyncio.Event()
+
+    def on_advertisement(device: BLEDevice, _advertisement: Any) -> None:
+        if device.address.upper() == address:
+            seen.set()
+
+    while True:
+        scanner = make_scanner(on_advertisement)
+        try:
+            await scanner.start()
+        except BleakDBusError as exc:
+            if exc.dbus_error != "org.bluez.Error.InProgress":
+                raise
+            if loop.time() + SCAN_RETRY_DELAY >= deadline:
+                raise KeyNotReachable(f"could not scan for the authenticator: {exc}") from exc
+            log.debug("BlueZ refused the scan (%s), retrying", exc.dbus_error)
+            await asyncio.sleep(SCAN_RETRY_DELAY)
+            continue
+        try:
+            async with asyncio.timeout(max(0.0, deadline - loop.time())):
+                await seen.wait()
+            return
+        except TimeoutError as exc:
+            raise KeyNotReachable(f"{address} did not advertise within {timeout:g}s") from exc
+        finally:
+            # Shielded: a scan left running makes BlueZ refuse this client's next one.
+            with contextlib.suppress(Exception):
+                await asyncio.shield(scanner.stop())
+
+
 class BleakGattConnector:
     """Connects to the bonded key through the device object BlueZ keeps for it.
 
-    It never scans: BlueZ's LE connect itself waits for the key to advertise, and a scan would
-    race with other programs' scans and with the bridge's own (BlueZ refuses a second scan from
-    the same client with InProgress, for example after a cancelled one).
+    A sleeping key is reachable only once it advertises again, so unless BlueZ already has it
+    connected, the connector first scans for its advertisement. (BlueZ's own LE connect is meant to
+    wait for that too, but on real hardware it did not notice a key being woken.)
     """
 
     def __init__(self, address: str, adapter: str | None = None) -> None:
         self._address = address.upper()
         self._adapter = adapter
+        self._scanner_args = BlueZScannerArgs(adapter=adapter) if adapter else BlueZScannerArgs()
         self._client_args = BlueZClientArgs(adapter=adapter) if adapter else BlueZClientArgs()
 
     async def connect(self, timeout: float, on_disconnect: Callable[[], None]) -> GattSession:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         device_path = await find_device_path(self._address, self._adapter)
         if device_path is None:
             raise KeyNotTrusted(
@@ -229,6 +277,13 @@ class BleakGattConnector:
             )
         state = await read_bond_state(device_path)
         check_bond(state, self._address)
+        if not state.device.get("Connected"):
+            # A connected key doesn't advertise, so only scan when BlueZ has no link to it.
+            await wait_for_advertisement(
+                lambda callback: BleakScanner(callback, bluez=self._scanner_args),
+                self._address,
+                max(0.0, deadline - loop.time()),
+            )
         device = BLEDevice(self._address, None, {"path": device_path, "props": state.device})
 
         client = await connect_with_retry(
@@ -239,7 +294,7 @@ class BleakGattConnector:
                 timeout=remaining,
                 bluez=self._client_args,
             ),
-            timeout,
+            max(0.0, deadline - loop.time()),
         )
         try:
             # Re-read after connecting: pairing state can change between scan and connect.
