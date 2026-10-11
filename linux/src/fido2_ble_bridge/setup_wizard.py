@@ -118,8 +118,20 @@ _T = TypeVar("_T")
 _ADDRESS_LINE = re.compile(r"^[ \t]*address[ \t]*=.*$", re.MULTILINE)
 _ADAPTER_LINE = re.compile(r"^[ \t]*adapter[ \t]*=.*$", re.MULTILINE)
 _BT_ADDRESS = re.compile(r"[0-9A-F]{2}(:[0-9A-F]{2}){5}")
-_KEY_FILE_GROUP = re.compile(r"\s*\[(?P<name>[^\]]*)\]\s*")
-_KEY_FILE_ENTRY = re.compile(r"\s*(?P<key>[A-Za-z0-9-]+)\s*=\s*(?P<value>.*?)\s*")
+# BlueZ's settings files are GLib key files, read here as GLib reads them: lines end at "\n"
+# only, and the space around names and values is g_ascii_isspace()'s (" \t\n\v\f\r"), not
+# Python's, which also splits lines and strips at U+2028, \x1c and the like. A device's Alias,
+# which any local user may set, can hold those characters.
+_KEY_FILE_LINE = re.compile(r"[^\n]*\n|[^\n]+\Z")
+_KEY_FILE_GROUP = re.compile(r"[ \t\n\v\f\r]*\[(?P<name>[^\]]*)\][ \t]*")
+_KEY_FILE_ENTRY = re.compile(
+    r"[ \t\n\v\f\r]*(?P<key>[^=]*?)[ \t\n\v\f\r]*=[ \t\n\v\f\r]*(?P<value>.*)", re.DOTALL
+)
+# g_key_file_get_integer(): strtol() in base 10, then nothing or a space.
+_KEY_FILE_INTEGER = re.compile(
+    r"[ \t\n\v\f\r]*(?P<number>[+-]?[0-9]+)(?:[ \t\n\v\f\r].*)?", re.DOTALL
+)
+_LINK_GROUP = "ConnectionParameters"
 
 
 class SetupError(Exception):
@@ -494,12 +506,12 @@ def _valid_mapping(entry: str, prefix: str) -> bool:
     return all(len(credential.split(",")) >= 4 for credential in credentials)
 
 
-def write_file(path: Path, text: str, mode: int = 0o644) -> None:
+def write_file(path: Path, text: str | bytes, mode: int = 0o644) -> None:
     """Replace `path` atomically: readers see the old file or the new one, never half of it."""
     path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     try:
-        with os.fdopen(fd, "w") as handle:
+        with os.fdopen(fd, "wb" if isinstance(text, bytes) else "w") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
@@ -523,64 +535,103 @@ def valid_link_parameters(min_interval: int, max_interval: int, latency: int, ti
     return 0 <= latency <= 499 and latency <= timeout * 4 // max_interval - 1
 
 
-def _key_file_lines(text: str) -> tuple[list[str], int | None, int]:
-    """`text`'s lines, and where its [ConnectionParameters] group starts (the header's index,
-    None if absent) and ends (the next header's index, or the line count)."""
-    lines = text.splitlines(keepends=True)
-    headers = [
-        (index, match["name"])
-        for index, line in enumerate(lines)
-        if (match := _KEY_FILE_GROUP.fullmatch(line.rstrip("\r\n")))
-    ]
-    start = next((index for index, name in headers if name == "ConnectionParameters"), None)
-    end = next((index for index, _name in headers if start is not None and index > start), None)
-    return lines, start, len(lines) if end is None else end
+def _logical(line: str) -> str:
+    """A key-file line as GLib parses it: without its "\n", and without a "\r" just before."""
+    return line[:-2] if line.endswith("\r\n") else line.removesuffix("\n")
+
+
+def _key_file(text: str) -> tuple[list[str], list[str | None], list[bool]]:
+    """`text`'s lines (with their endings), the group each belongs to (None before the first
+    header), and which are group headers."""
+    lines = _KEY_FILE_LINE.findall(text)
+    groups: list[str | None] = []
+    headers: list[bool] = []
+    group: str | None = None
+    for line in lines:
+        header = _KEY_FILE_GROUP.fullmatch(_logical(line))
+        if header is not None:
+            group = header["name"]
+        groups.append(group)
+        headers.append(header is not None)
+    return lines, groups, headers
+
+
+def _link_entry(line: str, group: str | None, header: bool) -> re.Match[str] | None:
+    if group != _LINK_GROUP or header:
+        return None
+    return _KEY_FILE_ENTRY.fullmatch(_logical(line))
 
 
 def link_parameters(text: str) -> dict[str, str] | None:
-    """The [ConnectionParameters] entries of a BlueZ device settings file (a GLib key file),
-    None if it has no such group."""
-    lines, start, end = _key_file_lines(text)
-    if start is None:
+    """The [ConnectionParameters] entries of a BlueZ device settings file, None if it has no
+    such group. GLib merges a group that appears more than once, and the last value wins."""
+    lines, groups, headers = _key_file(text)
+    if _LINK_GROUP not in groups:
         return None
     return {
-        match["key"]: match["value"]
-        for line in lines[start + 1 : end]
-        if (match := _KEY_FILE_ENTRY.fullmatch(line.rstrip("\r\n")))
+        entry["key"]: entry["value"]
+        for line, group, header in zip(lines, groups, headers, strict=True)
+        if (entry := _link_entry(line, group, header))
     }
 
 
+def _key_file_integer(value: str) -> int | None:
+    """`value` as BlueZ reads it: through g_key_file_get_integer() into a 16-bit field."""
+    match = _KEY_FILE_INTEGER.fullmatch(value)
+    if match is None or not -(2**31) <= int(match["number"]) < 2**31:
+        return None
+    return int(match["number"]) & 0xFFFF
+
+
 def _allows_timeout(entries: dict[str, str]) -> bool:
-    try:
-        values = [int(entries[key]) for key, _value in LINK_PARAMETERS]
-    except (KeyError, ValueError):
+    values = [_key_file_integer(entries.get(key, "")) for key, _value in LINK_PARAMETERS]
+    if any(value is None for value in values):
         return False
-    return valid_link_parameters(*values) and values[3] >= SUPERVISION_TIMEOUT
+    numbers = [value for value in values if value is not None]
+    return valid_link_parameters(*numbers) and numbers[3] >= SUPERVISION_TIMEOUT
 
 
 def with_link_parameters(text: str) -> str | None:
     """`text`, a BlueZ device settings file, with connection parameters that give the key
-    SUPERVISION_TIMEOUT; None if the ones it has already do. Only that group changes: the rest,
-    bond keys included, stays as it is, byte for byte."""
-    lines, start, end = _key_file_lines(text)
-    ours = [f"{key}={value}\n" for key, value in LINK_PARAMETERS]
-    if start is None:
-        group = "[ConnectionParameters]\n" + "".join(ours)
-        if not text:
-            return group
-        # A blank line between groups, as BlueZ writes them.
-        return text + ("\n" if text.endswith("\n") else "\n\n") + group
+    SUPERVISION_TIMEOUT; None if the ones it has already do. Only that group changes: every
+    other line, the bond's keys among them, stays as it is. ValueError if the result would not
+    read back that way."""
     entries = link_parameters(text)
     if entries is not None and _allows_timeout(entries):
         return None
-    names = {key for key, _value in LINK_PARAMETERS}
-    kept = [
-        line
-        for line in lines[start + 1 : end]
-        if not ((match := _KEY_FILE_ENTRY.fullmatch(line.rstrip("\r\n"))) and match["key"] in names)
+    ours = [f"{key}={value}\n" for key, value in LINK_PARAMETERS]
+    if entries is None:
+        appended = f"[{_LINK_GROUP}]\n" + "".join(ours)
+        # A blank line between groups, as BlueZ writes them.
+        separator = "\n" if text.endswith("\n") else "\n\n"
+        new = appended if not text else text + separator + appended
+    else:
+        lines, groups, headers = _key_file(text)
+        names = {key for key, _value in LINK_PARAMETERS}
+        first = groups.index(_LINK_GROUP)
+        kept: list[str] = []
+        for index, (line, group, header) in enumerate(zip(lines, groups, headers, strict=True)):
+            entry = _link_entry(line, group, header)
+            if entry is not None and entry["key"] in names:
+                continue  # every copy goes: GLib would let a later one win over ours
+            kept.append(line if index != first or line.endswith("\n") else line + "\n")
+            if index == first:
+                kept.extend(ours)
+        new = "".join(kept)
+    if _outside_link_group(new) != _outside_link_group(text) or not _allows_timeout(
+        link_parameters(new) or {}
+    ):
+        raise ValueError("the edited file would not read back as intended")
+    return new
+
+
+def _outside_link_group(text: str) -> list[str]:
+    lines, groups, _headers = _key_file(text)
+    return [
+        _logical(line)
+        for line, group in zip(lines, groups, strict=True)
+        if group != _LINK_GROUP and _logical(line)
     ]
-    header = lines[start] if lines[start].endswith("\n") else lines[start] + "\n"
-    return "".join([*lines[:start], header, *ours, *kept, *lines[end:]])
 
 
 def _first_line(text: str) -> str:
@@ -1135,7 +1186,9 @@ class Setup:
         for it. True if Bluetooth was restarted for that, which the bridge must follow."""
         path = self.bond_file
         try:
-            text = path.read_text() if path is not None else None
+            # Bytes, decoded so that they encode back unchanged: no newline translation, and
+            # no failure on whatever a device name holds.
+            text = path.read_bytes().decode("utf-8", "surrogateescape") if path else None
         except FileNotFoundError:
             text = None
         except OSError as exc:
@@ -1145,7 +1198,13 @@ class Setup:
             self.say("  BlueZ keeps no settings file for the key where setup looks, so its")
             self.say("  connections keep the default supervision timeout of 0.42 s.")
             return False
-        new = with_link_parameters(text)
+        try:
+            new = with_link_parameters(text)
+        except ValueError as exc:
+            raise SetupError(
+                f"not changing {path}: {exc}. Add the [{_LINK_GROUP}] group by hand (see the "
+                "README's manual setup), or leave it."
+            ) from exc
         if new is None:
             self.say(f"  The key's connections already allow {seconds} without radio contact.")
             return False
@@ -1157,12 +1216,12 @@ class Setup:
             self.console,
             f"  Allow {seconds} and restart Bluetooth now? (Bluetooth devices reconnect by "
             "themselves.)",
-            default=True,
+            default=False,
         ):
             self.say("  Left as it is; run setup again to change it.")
             return False
         old = link_parameters(text)
-        write_file(path, new, mode=0o600)
+        write_file(path, new.encode("utf-8", "surrogateescape"), mode=0o600)
         restore = (
             f"delete the [ConnectionParameters] group from {path}"
             if old is None
@@ -1207,10 +1266,17 @@ class Setup:
             return False
         try:
             bluetooth = await BluezPairing.open(bus, self.key_adapter, key=address)
-            if not await bluetooth.powered():
+            # bluetoothd turns adapters off when it stops, and only AutoEnable turns them on
+            # again; step 2 left this one on.
+            if await bluetooth.power_on():
                 return False
             devices = await bluetooth.devices()
-        except BluetoothError:
+        except BluetoothError as exc:
+            if exc.name == BLOCKED:
+                raise SetupError(
+                    "Bluetooth came back blocked (rfkill) after the restart. Unblock it with sudo "
+                    "rfkill unblock bluetooth, then run setup again."
+                ) from exc
             return False
         finally:
             bus.disconnect()

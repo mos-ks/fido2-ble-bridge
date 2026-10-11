@@ -358,9 +358,6 @@ class BluezPairing:
         static = getattr(props.get("AddressType"), "value", "public") == "random"
         return f"static-{address}" if static else address
 
-    async def powered(self) -> bool:
-        return await self._adapter_flag("Powered")
-
     async def power_on(self) -> bool:
         """Turn the adapter on if it is off; True if it was off."""
         if await self._adapter_flag("Powered"):

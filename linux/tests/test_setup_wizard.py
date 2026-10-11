@@ -798,8 +798,8 @@ def test_the_key_gets_a_longer_supervision_timeout_after_asking(world: World) ->
     assert world.run() == 0
     info = bond_info(world.paths)
 
-    # Use the bonded key; allow 5 s (Enter); keep the registration; no backup key.
-    world.answer("yes", "", "", "")
+    # Use the bonded key; allow 5 s; keep the registration; no backup key.
+    world.answer("yes", "y", "", "")
     assert world.run() == 0
     assert info.read_text() == BOND_INFO + "\n" + LINK_GROUP
     assert stat.S_IMODE(info.stat().st_mode) == 0o600
@@ -816,13 +816,54 @@ def test_the_key_gets_a_longer_supervision_timeout_after_asking(world: World) ->
     assert world.console.answers == []
 
 
-def test_declining_leaves_the_settings_and_bluetooth_alone(world: World) -> None:
+@pytest.mark.parametrize("answer", ["n", ""])
+def test_declining_leaves_the_settings_and_bluetooth_alone(world: World, answer: str) -> None:
+    # Enter, or the end of the input, declines: Bluetooth only restarts on a yes.
     info = bond_info(world.paths)
-    setup = paired_setup(world, "n")
+    setup = paired_setup(world, answer)
     assert setup.link(KEY) is False
     assert info.read_text() == BOND_INFO
     assert world.runner.ran("systemctl", "restart") == []
     assert setup.changes == []
+
+
+def test_bytes_glib_keeps_are_kept_in_the_settings_file(world: World) -> None:
+    # A lone \r, a vertical tab and bytes that are not UTF-8 in a name any local user can set:
+    # all stay exactly as they were, and the group goes after them.
+    original = BOND_INFO.encode() + b"\n[General]\nAlias=a\rb\x0b[ConnectionParameters]\x0bX\xff\n"
+    info = bond_info(world.paths)
+    info.write_bytes(original)
+    setup = paired_setup(world, "y")
+    assert setup.link(KEY) is True
+    assert info.read_bytes() == original + b"\n" + LINK_GROUP.encode()
+
+
+def test_an_adapter_bluez_left_off_after_the_restart_is_turned_on(world: World) -> None:
+    # bluetoothd turns adapters off when it stops; without AutoEnable they stay off.
+    bond_info(world.paths)
+    setup = paired_setup(world, "y")
+
+    def restart_powered_off(_argv: list[str]) -> Completed:
+        world.bluez.objects[ADAPTER_PATH]["org.bluez.Adapter1"]["Powered"] = False
+        return Completed(0)
+
+    world.runner.on("systemctl", "restart", "bluetooth", result=restart_powered_off)
+    assert setup.link(KEY) is True
+    assert world.bluez.objects[ADAPTER_PATH]["org.bluez.Adapter1"]["Powered"] is True
+
+
+def test_an_adapter_blocked_after_the_restart_points_at_rfkill(world: World) -> None:
+    bond_info(world.paths)
+    setup = paired_setup(world, "y")
+
+    def restart_blocked(_argv: list[str]) -> Completed:
+        world.bluez.objects[ADAPTER_PATH]["org.bluez.Adapter1"]["Powered"] = False
+        world.bluez.power_error = "org.bluez.Error.Blocked"
+        return Completed(0)
+
+    world.runner.on("systemctl", "restart", "bluetooth", result=restart_blocked)
+    with pytest.raises(SetupError, match="rfkill unblock bluetooth"):
+        setup.link(KEY)
 
 
 def test_parameters_that_already_allow_the_timeout_are_kept_without_asking(world: World) -> None:
@@ -858,7 +899,7 @@ def test_without_bluez_settings_for_the_key_its_link_is_left_alone(world: World)
 def test_an_adapter_with_a_static_address_keeps_its_settings_under_static(world: World) -> None:
     world.bluez.objects[ADAPTER_PATH]["org.bluez.Adapter1"]["AddressType"] = "random"
     info = bond_info(world.paths, adapter_dir=f"static-{ADAPTER_ADDRESS}")
-    setup = paired_setup(world, "")
+    setup = paired_setup(world, "y")
     assert setup.bond_file == info
     assert setup.link(KEY) is True
     assert info.read_text().endswith(LINK_GROUP)
@@ -867,7 +908,7 @@ def test_an_adapter_with_a_static_address_keeps_its_settings_under_static(world:
 def test_a_failed_bluetooth_restart_says_how_to_apply_the_setting(world: World) -> None:
     world.runner.on("systemctl", "restart", "bluetooth", result=Completed(1, "", "Failed.\n"))
     info = bond_info(world.paths)
-    setup = paired_setup(world, "")
+    setup = paired_setup(world, "y")
     with pytest.raises(SetupError, match="takes effect once Bluetooth restarts"):
         setup.link(KEY)
     assert info.read_text().endswith(LINK_GROUP)
@@ -876,7 +917,7 @@ def test_a_failed_bluetooth_restart_says_how_to_apply_the_setting(world: World) 
 
 def test_bluez_that_does_not_list_the_key_again_stops_setup(world: World) -> None:
     bond_info(world.paths)
-    setup = paired_setup(world, "")
+    setup = paired_setup(world, "y")
     setup.timing = dataclasses.replace(FAST, bluetooth=0.05)
 
     def restart_without_the_key(_argv: list[str]) -> Completed:
@@ -902,6 +943,29 @@ def test_bluez_that_does_not_list_the_key_again_stops_setup(world: World) -> Non
             "[LongTermKey]\nKey=0\n",
             LINK_GROUP + "# kept\nOther=x\n\n[LongTermKey]\nKey=0\n",
         ),
+        # Python's line breaks and spaces are not GLib's: a fake header inside a value stays
+        # a value, and the group is added at the end.
+        (
+            "[General]\nAlias=a\x0b[ConnectionParameters]\x0bX\nName=K\n",
+            "[General]\nAlias=a\x0b[ConnectionParameters]\x0bX\nName=K\n\n" + LINK_GROUP,
+        ),
+        (
+            "[General]\nAlias=a\u2028[ConnectionParameters]\n",
+            "[General]\nAlias=a\u2028[ConnectionParameters]\n\n" + LINK_GROUP,
+        ),
+        # Lines ending in \r\n are GLib's lines too.
+        (
+            "[General]\r\nName=K\r\n[ConnectionParameters]\r\nTimeout=42\r\n",
+            "[General]\r\nName=K\r\n[ConnectionParameters]\r\n" + LINK_GROUP.split("\n", 1)[1],
+        ),
+        # GLib merges a repeated group and lets the last value win: every copy of ours goes.
+        (
+            LINK_GROUP + "\n[LongTermKey]\nKey=0\n\n[ConnectionParameters]\nTimeout=42\nOther=x\n",
+            LINK_GROUP + "\n[LongTermKey]\nKey=0\n\n[ConnectionParameters]\nOther=x\n",
+        ),
+        # Numbers GLib does not read as numbers (it reads 0).
+        (LINK_GROUP.replace("500", "\uff15\uff10\uff10"), LINK_GROUP),
+        (LINK_GROUP.replace("500", "5_00"), LINK_GROUP),
         # Values BlueZ reads as 0 (not numbers) and a group the kernel would ignore.
         (
             "[ConnectionParameters]\nMinInterval=x\nMaxInterval=40\nLatency=0\nTimeout=500\n",
@@ -920,6 +984,15 @@ def test_link_parameters_change_only_their_group(text: str, expected: str) -> No
 def test_usable_link_parameters_are_left_as_they_are() -> None:
     assert with_link_parameters(LINK_GROUP) is None
     assert with_link_parameters("[A]\n" + LINK_GROUP.replace("500", "3200") + "[B]\n") is None
+    # GLib reads "500 s" as 500: a space ends the number.
+    assert with_link_parameters(LINK_GROUP.replace("500", " 500 s")) is None
+
+
+def test_an_edit_that_would_not_read_back_is_refused() -> None:
+    # A last line ending in \r without \n: adding the \n would turn it into a \r\n ending
+    # and change the value GLib reads.
+    with pytest.raises(ValueError, match="would not read back"):
+        with_link_parameters("[General]\nName=K\r")
 
 
 @pytest.mark.parametrize(
