@@ -11,17 +11,17 @@ its own login stack use the key over Bluetooth LE.
 
 ## Linux
 
-The bridge in [`linux/`](linux/README.md) is a Python service for systemd. It needs BlueZ
-≥ 5.65, systemd ≥ 253, the `uhid` kernel module and a key that supports FIDO2 over BLE
-(CTAP 2.1 section 11.4). It connects only to the one configured key, and only when BlueZ
-reports that key as bonded, and it relays CTAP2 messages unchanged. To install it, run
-`sudo ./install.sh` in `linux/`; its guided setup pairs the key, registers it for your account,
-tests a login and then enables the key for logins. It asks before it installs packages, pairs or
-uses a key (you type `yes` after seeing which device), removes or replaces a pairing or
-registration, sets a PIN or enrolls a finger, gives the key's Bluetooth connections a longer
-timeout (which restarts Bluetooth), and enables PAM, and at the end it lists every change with
-its undo. At a login or `sudo`, a hint tells you to wake the key; the password prompt follows
-only when the key fails or is not reached.
+The bridge in [`linux/`](linux/README.md) is a Python service for systemd. It needs BlueZ ≥
+5.65, systemd ≥ 253, the `uhid` kernel module and a key that supports FIDO2 over BLE (CTAP 2.1
+section 11.4). It connects only to the one configured key, and only when BlueZ reports that key
+as bonded, and it relays CTAP2 messages unchanged. To install it, run `sudo ./install.sh` in
+`linux/`; its guided setup pairs the key, registers it for your account, tests a login and then
+enables the key for logins. It asks before it installs packages, pairs or uses a key (you type
+`yes` after seeing which device), removes or replaces a pairing or registration, sets a PIN or
+enrolls a finger, sets faster and more tolerant timing for the key's Bluetooth connections
+(which restarts Bluetooth), and enables PAM, and at the end it lists every change with its undo.
+At a login or `sudo`, a hint tells you to wake the key; the password prompt follows only when
+the key fails or is not reached.
 
 **Security.** The bridge is only a transport and cannot log anyone in. `pam_u2f` sends a fresh
 challenge, the key signs it with a private key that never leaves the key, and `pam_u2f`

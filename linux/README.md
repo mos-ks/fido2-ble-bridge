@@ -49,10 +49,11 @@ can stop at any point (Ctrl-C) and run it again:
    [the security model](#security-model)). An existing pairing is only removed after you agree.
 3. **Configuration.** It writes the key's address into `/etc/fido2-ble-bridge/config.toml`,
    keeping your other settings and comments. On a computer with several Bluetooth adapters it
-   also writes the one the key is bonded on. Then, after asking, it lets the key's connections
-   go 5 seconds without radio contact instead of Linux's default 0.42 s, in BlueZ's settings
-   for the key (the `[ConnectionParameters]` group of
-   `/var/lib/bluetooth/<adapter>/<key>/info`), and restarts Bluetooth so that BlueZ loads it.
+   also writes the one the key is bonded on. Then, after asking, it gives the key's
+   connections a 20 ms interval instead of Linux's 30 to 50 ms, which makes a login faster, and
+   lets them go 5 seconds without radio contact instead of 0.42 s, in BlueZ's settings for the
+   key (the `[ConnectionParameters]` group of `/var/lib/bluetooth/<adapter>/<key>/info`), and
+   restarts Bluetooth so that BlueZ loads them. It keeps values the key itself asked for.
 4. **Service.** It enables and starts the bridge, then checks the key over Bluetooth. Wake the
    key when asked (a short press).
 5. **Fingerprint.** It finds the bridge's virtual device (by its name, bus and `phys`, and only
@@ -187,8 +188,8 @@ On top of that:
   the profile's own `pam_u2f` line worked, tests the PAM line outside `/etc/pam.d` before
   enabling anything, refuses a weakened profile, never edits PAM files itself (only
   `pam-auth-update` does, never with `--force`), never writes a config that fails validation,
-  and never logs passkeys or registration data. When it gives the key a longer supervision
-  timeout, it changes only the `[ConnectionParameters]` group of BlueZ's settings file for the
+  and never logs passkeys or registration data. When it sets the key's connection timing, it
+  changes only the `[ConnectionParameters]` group of BlueZ's settings file for the
   key, reads that file exactly as GLib does (so a device name or alias that another local user
   chose cannot make it split a line), and refuses any edit that would change another line,
   the bond's keys among them.
@@ -329,15 +330,17 @@ $ fido2-token -L                     # the bridge shows up as a USB FIDO device
 $ fido2-token -I /dev/hidraw5        # with the key awake: its real getInfo
 ```
 
-Linux ends a Bluetooth LE connection after 0.42 s without radio contact, and a key that pauses
-longer, busy or a few metres away, then drops a login midway. BlueZ loads longer limits for one
-device from its settings file when it starts. Add this group to the key's file (or change the
-values, if the file has the group already):
+Linux talks to a Bluetooth LE device every 30 to 50 ms (the controller picks near 50), and a
+login needs some thirty exchanges with the key, each about two intervals long. It also ends a
+connection after 0.42 s without radio contact, so a key that pauses longer, busy or a few
+metres away, drops a login midway. BlueZ loads other values for one device from its settings
+file when it starts. Add this group to the key's file (or change the values, if the file has
+the group already):
 
 ```ini
 [ConnectionParameters]
-MinInterval=24
-MaxInterval=40
+MinInterval=16
+MaxInterval=16
 Latency=0
 Timeout=500
 ```
@@ -348,9 +351,10 @@ $ sudoedit /var/lib/bluetooth/<adapter>/AA:BB:CC:DD:EE:FF/info
 $ sudo systemctl restart bluetooth   # Bluetooth devices reconnect by themselves
 ```
 
-The intervals are Linux's defaults (30 to 50 ms, in units of 1.25 ms); `Timeout` is in units of
-10 ms. BlueZ keeps the group until the pairing is removed, or until the key asks for parameters
-of its own.
+That is a 20 ms interval (units of 1.25 ms) and a 5 s timeout (units of 10 ms). Do not go below
+the key's own minimum: a key offered less asks for its own values, and BlueZ then stores those
+over yours (a Feitian AllinPass K33 asks for 20 to 50 ms and a 4 s timeout). BlueZ keeps the
+group until the pairing is removed, or until the key asks for parameters of its own.
 
 ### 3. Fingerprint
 
@@ -616,7 +620,7 @@ the service after editing (`sudo systemctl restart fido2-ble-bridge`).
   subscribed at the same moment (BlueZ sends a copy per subscriber), for example setup while
   the bridge still held its link from a login. Wait 10 seconds (`idle_disconnect`) and try
   again.
-- `check` says BlueZ **kept refusing to scan** (`org.bluez.Error.InProgress`), and
+- `check` or a login says BlueZ **refuses to scan** (`org.bluez.Error.InProgress`), and
   `bluetoothctl scan le` fails the same way while `bluetoothctl show` reports `Discovering: no`:
   the Bluetooth controller is stuck, and the kernel log (`journalctl -k`) repeats
   `Opcode 0x2041 failed: -16` and `start background scanning failed: -16`. Logins cannot reach
@@ -625,7 +629,9 @@ the service after editing (`sudo systemctl restart fido2-ble-bridge`).
   disconnected`** in the middle of a request: the connection was lost. When `sudo btmon` shows
   `Disconnect Complete` with `Reason: Connection Timeout (0x08)` (the kernel log may add `ACL
   packet for unknown connection handle`), the key went quiet longer than the supervision
-  timeout. Run setup again and allow 5 s in step 3, or see [Manual setup](#2-configure-and-check).
+  timeout. Run setup again and accept its connection timing in step 3, or see
+  [Manual setup](#2-configure-and-check). A key that drops a link it has just accepted, while
+  BlueZ still reads its services, is connected again automatically within the connect timeout.
 - Setup's **login test fails**: nothing was saved, so `/etc/fido2-ble-bridge/u2f_mappings` and
   PAM are as they were, and an earlier registration still works. Check the enrolled finger
   before trying again (`fido2-token -I /dev/hidrawN` must list `uv`).

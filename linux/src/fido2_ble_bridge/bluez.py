@@ -19,7 +19,7 @@ from bleak.args.bluez import BlueZClientArgs, BlueZScannerArgs
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
 from bleak.backends.service import BleakGATTService
-from bleak.exc import BleakDBusError
+from bleak.exc import BleakDBusError, BleakDeviceNotFoundError, BleakError
 from dbus_fast import BusType, Message, MessageType
 from dbus_fast.aio import MessageBus
 
@@ -184,10 +184,20 @@ RETRYABLE_CONNECT_ERRORS = frozenset({"org.bluez.Error.InProgress", "org.bluez.E
 CONNECT_RETRY_DELAY = 0.5
 
 
+def _retryable(exc: BleakError) -> bool:
+    if isinstance(exc, BleakDBusError):
+        return exc.dbus_error in RETRYABLE_CONNECT_ERRORS
+    # bleak's own errors, such as "failed to discover services, device disconnected": a key
+    # (a Feitian AllinPass K33, for one) can drop a link it just accepted while BlueZ still reads
+    # its services. Nothing has reached the FIDO service yet, so connecting again is safe.
+    return not isinstance(exc, BleakDeviceNotFoundError)
+
+
 async def connect_with_retry(
     make_client: Callable[[float], BleakClient], timeout: float
 ) -> BleakClient:
-    """Connects a fresh client per attempt, retrying RETRYABLE_CONNECT_ERRORS until `timeout`."""
+    """Connects a fresh client per attempt, retrying failures that clear up by themselves
+    (RETRYABLE_CONNECT_ERRORS, a link dropped while connecting) until `timeout`."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while True:
@@ -195,73 +205,51 @@ async def connect_with_retry(
         try:
             await client.connect()
             return client
-        except BleakDBusError as exc:
-            if exc.dbus_error not in RETRYABLE_CONNECT_ERRORS:
+        except BleakError as exc:
+            if not _retryable(exc):
                 raise
             if loop.time() + CONNECT_RETRY_DELAY >= deadline:
                 raise KeyNotReachable(f"connecting to the authenticator failed: {exc}") from exc
-            log.debug("BlueZ refused the connect (%s), retrying", exc.dbus_error)
+            log.debug("connecting failed (%s), retrying", exc)
             await asyncio.sleep(CONNECT_RETRY_DELAY)
 
 
-SCAN_RETRY_DELAY = 0.5
+# A stuck controller refuses every scan until it is reset, the kernel's own included, and
+# BlueZ answers any client's StartDiscovery with InProgress (its reply to every kernel refusal).
+STUCK_ADAPTER = (
+    "BlueZ refuses to scan for the authenticator ({error}); the Bluetooth adapter is probably "
+    "stuck: turn it off and on with `bluetoothctl power off` and `bluetoothctl power on`"
+)
+# Seconds a connect attempt leaves of its deadline for raise_if_adapter_stuck.
+ADAPTER_CHECK_TIME = 0.5
 
 
-async def wait_for_advertisement(
+async def raise_if_adapter_stuck(
     make_scanner: Callable[[Callable[[BLEDevice, Any], None]], BleakScanner],
-    address: str,
-    timeout: float,
 ) -> None:
-    """Scans until `address` advertises (a sleeping key does once it is woken), within `timeout`.
-
-    BlueZ refuses a new scan from a client whose earlier scan is still running (InProgress), so
-    the scan is always stopped, even when the caller is cancelled, and a refused start is retried.
-    BlueZ also answers InProgress whenever the kernel refuses to start discovery, which a stuck
-    controller does on every attempt until it is reset; the final error says so.
-    """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    seen = asyncio.Event()
-
-    def on_advertisement(device: BLEDevice, _advertisement: Any) -> None:
-        if device.address.upper() == address:
-            seen.set()
-
-    while True:
-        scanner = make_scanner(on_advertisement)
-        try:
-            await scanner.start()
-        except BleakDBusError as exc:
-            if exc.dbus_error != "org.bluez.Error.InProgress":
-                raise
-            if loop.time() + SCAN_RETRY_DELAY >= deadline:
-                raise KeyNotReachable(
-                    f"BlueZ kept refusing to scan for the authenticator ({exc.dbus_error}); the "
-                    "Bluetooth adapter is probably stuck: turn it off and on with "
-                    "`bluetoothctl power off` and `bluetoothctl power on`"
-                ) from exc
-            log.debug("BlueZ refused the scan (%s), retrying", exc.dbus_error)
-            await asyncio.sleep(SCAN_RETRY_DELAY)
-            continue
-        try:
-            async with asyncio.timeout(max(0.0, deadline - loop.time())):
-                await seen.wait()
-            return
-        except TimeoutError as exc:
-            raise KeyNotReachable(f"{address} did not advertise within {timeout:g}s") from exc
-        finally:
-            # Shielded: a scan left running makes BlueZ refuse this client's next one.
-            with contextlib.suppress(Exception):
-                await asyncio.shield(scanner.stop())
+    """After a connect that did not complete: KeyNotReachable naming the adapter if BlueZ
+    refuses a scan, which tells a stuck controller apart from a key that did not wake. A scan it
+    starts is stopped again, even when the caller is cancelled."""
+    scanner = make_scanner(lambda _device, _advertisement: None)
+    try:
+        await scanner.start()
+    except BleakDBusError as exc:
+        if exc.dbus_error == "org.bluez.Error.InProgress":
+            raise KeyNotReachable(STUCK_ADAPTER.format(error=exc.dbus_error)) from exc
+        return
+    # Shielded: a scan left running makes BlueZ refuse this client's next one.
+    with contextlib.suppress(Exception):
+        await asyncio.shield(scanner.stop())
 
 
 class BleakGattConnector:
     """Connects to the bonded key through the device object BlueZ keeps for it.
 
-    A sleeping key is reachable only once it advertises again, so unless BlueZ already has it
-    connected, the connector first scans for its advertisement. BlueZ's own LE connect waits for
-    it too, through the kernel's background scan, but when the adapter refuses to scan that
-    connect just never completes; the explicit scan reports the refusal instead.
+    BlueZ's LE connect waits for a sleeping key to advertise again, through the kernel's
+    background scan, and connects on its first advertisement. A scan of the bridge's own before
+    it only added a second wait (on real hardware 0.2 to 1.7 s more). When the connect does not
+    complete in time, raise_if_adapter_stuck tells a stuck adapter, which refuses every scan,
+    apart from a key that was not woken.
     """
 
     def __init__(self, address: str, adapter: str | None = None) -> None:
@@ -280,27 +268,26 @@ class BleakGattConnector:
             )
         state = await read_bond_state(device_path)
         check_bond(state, self._address)
-        if not state.device.get("Connected"):
-            # A connected key doesn't advertise, so only scan when BlueZ has no link to it.
-            await wait_for_advertisement(
-                lambda callback: BleakScanner(callback, bluez=self._scanner_args),
-                self._address,
-                max(0.0, deadline - loop.time()),
-            )
         device = BLEDevice(self._address, None, {"path": device_path, "props": state.device})
 
-        client = await connect_with_retry(
-            lambda remaining: BleakClient(
-                device,
-                disconnected_callback=lambda _client: on_disconnect(),
-                services=[FIDO_SERVICE_UUID],
-                timeout=remaining,
-                bluez=self._client_args,
-            ),
-            max(0.0, deadline - loop.time()),
-        )
         try:
-            # Re-read after connecting: pairing state can change between scan and connect.
+            client = await connect_with_retry(
+                lambda remaining: BleakClient(
+                    device,
+                    disconnected_callback=lambda _client: on_disconnect(),
+                    services=[FIDO_SERVICE_UUID],
+                    timeout=remaining,
+                    bluez=self._client_args,
+                ),
+                max(0.0, deadline - loop.time() - ADAPTER_CHECK_TIME),
+            )
+        except (KeyNotReachable, TimeoutError):
+            await raise_if_adapter_stuck(
+                lambda callback: BleakScanner(callback, bluez=self._scanner_args)
+            )
+            raise
+        try:
+            # Re-read after connecting: pairing state can change while connecting.
             check_bond(await read_bond_state(device_path), self._address)
             return BleakGattSession(client)
         except BaseException:

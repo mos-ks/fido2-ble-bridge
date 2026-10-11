@@ -89,8 +89,8 @@ built-in verification no secret ever crosses the bridge.
   `openasuser`, `expand` or unknown options. A new registration replaces all of the user's
   authfile lines, since `pam_u2f` reads only the last. Setup changes PAM only through
   `pam-auth-update` and never with `--force`, never retries a fingerprint request, and stops at
-  Ctrl-C during the login test. To give the key a 5 s supervision timeout it edits BlueZ's
-  settings file for the key (which holds the bond's long-term key) only after you agree: it
+  Ctrl-C during the login test. To give the key faster and more tolerant connection timing
+  (20 ms interval, 5 s supervision timeout) it edits BlueZ's settings file for the key (which holds the bond's long-term key) only after you agree: it
   touches only the `[ConnectionParameters]` group, reads the file the way GLib does so that a
   device alias another user set cannot fake a group or split a line, refuses an edit that would
   change any other line, writes atomically with mode 0600, and records the undo.

@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 from typing import Any
 
 import pytest
@@ -6,7 +7,7 @@ from bleak import BleakScanner
 from bleak.args.bluez import BlueZScannerArgs
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
-from bleak.exc import BleakDBusError
+from bleak.exc import BleakDBusError, BleakDeviceNotFoundError, BleakError
 from dbus_fast import Variant
 
 from fido2_ble_bridge import bluez
@@ -15,8 +16,8 @@ from fido2_ble_bridge.bluez import (
     FoundKey,
     connect_with_retry,
     device_path_for,
+    raise_if_adapter_stuck,
     scan_fido_devices,
-    wait_for_advertisement,
 )
 
 
@@ -34,13 +35,14 @@ def test_device_path_is_found_by_address_and_adapter() -> None:
 
 
 class _Client:
-    def __init__(self, errors: list[str], log: list[float], timeout: float) -> None:
+    def __init__(self, errors: list[str | Exception], log: list[float], timeout: float) -> None:
         self._errors = errors
         log.append(timeout)
 
     async def connect(self) -> None:
         if self._errors:
-            raise BleakDBusError(self._errors.pop(0), ["busy"])
+            error = self._errors.pop(0)
+            raise error if isinstance(error, Exception) else BleakDBusError(error, ["busy"])
 
 
 async def test_connect_retries_errors_that_clear_up_by_themselves(
@@ -98,44 +100,49 @@ def _script(**overrides: Any) -> dict[str, Any]:
     return script
 
 
-async def test_scan_waits_for_the_key_and_always_stops(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(bluez, "SCAN_RETRY_DELAY", 0.01)
-    script = _script(refusals=2)
-    await wait_for_advertisement(lambda cb: _Scanner(cb, script), "AA:BB", 5)  # type: ignore[arg-type,return-value]
-    assert script["starts"] == 3  # two refused starts were retried
+async def test_a_refused_scan_after_a_failed_connect_names_the_adapter() -> None:
+    script = _script(refusals=1)
+    with pytest.raises(KeyNotReachable, match="bluetoothctl power off") as raised:
+        await raise_if_adapter_stuck(lambda cb: _Scanner(cb, script))  # type: ignore[arg-type,return-value]
+    assert "org.bluez.Error.InProgress" in str(raised.value)
     assert script["running"] == 0
 
 
-async def test_scan_times_out_when_the_key_stays_asleep() -> None:
+async def test_a_scan_that_starts_is_stopped_and_blames_nothing() -> None:
     script = _script(advertise_after=None)
-    with pytest.raises(KeyNotReachable, match="did not advertise"):
-        await wait_for_advertisement(lambda cb: _Scanner(cb, script), "AA:BB", 0.1)  # type: ignore[arg-type,return-value]
+    await raise_if_adapter_stuck(lambda cb: _Scanner(cb, script))  # type: ignore[arg-type,return-value]
+    assert script["starts"] == 1
     assert script["running"] == 0
 
 
-async def test_scan_refused_until_the_deadline_points_at_the_adapter(
+async def test_the_check_scan_is_stopped_even_when_the_caller_is_cancelled() -> None:
+    script = _script(advertise_after=None)
+    checker = asyncio.create_task(raise_if_adapter_stuck(lambda cb: _Scanner(cb, script)))  # type: ignore[arg-type,return-value]
+    await asyncio.sleep(0.005)  # inside the shielded stop
+    checker.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await checker
+    await asyncio.sleep(0.05)
+    assert script["running"] == 0
+
+
+async def test_a_link_dropped_while_connecting_is_connected_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(bluez, "SCAN_RETRY_DELAY", 0.01)
-    script = _script(refusals=1000)
-    with pytest.raises(KeyNotReachable, match="bluetoothctl power off") as raised:
-        await wait_for_advertisement(lambda cb: _Scanner(cb, script), "AA:BB", 0.1)  # type: ignore[arg-type,return-value]
-    assert "org.bluez.Error.InProgress" in str(raised.value)
-    assert script["starts"] > 1  # retried before giving up
-    assert script["running"] == 0
+    monkeypatch.setattr(bluez, "CONNECT_RETRY_DELAY", 0.01)
+    errors: list[str | Exception] = [BleakError("failed to discover services, device disconnected")]
+    attempts: list[float] = []
+    client = await connect_with_retry(lambda t: _Client(errors, attempts, t), 5)  # type: ignore[arg-type,return-value]
+    assert isinstance(client, _Client)
+    assert len(attempts) == 2
 
 
-async def test_scan_is_stopped_even_when_the_wait_is_cancelled() -> None:
-    script = _script(advertise_after=None)
-    waiter = asyncio.create_task(
-        wait_for_advertisement(lambda cb: _Scanner(cb, script), "AA:BB", 5)  # type: ignore[arg-type,return-value]
-    )
-    await asyncio.sleep(0.05)
-    waiter.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await waiter
-    await asyncio.sleep(0.05)  # the shielded stop finishes after the cancellation
-    assert script["running"] == 0
+async def test_a_device_bluez_does_not_know_is_not_retried() -> None:
+    errors: list[str | Exception] = [BleakDeviceNotFoundError("AA:BB")]
+    attempts: list[float] = []
+    with pytest.raises(BleakDeviceNotFoundError):
+        await connect_with_retry(lambda t: _Client(errors, attempts, t), 5)  # type: ignore[arg-type,return-value]
+    assert len(attempts) == 1
 
 
 async def test_connect_does_not_retry_other_errors() -> None:
