@@ -107,13 +107,15 @@ def test_pam_u2f_uses_only_the_last_line_of_a_user(tmp_path: Path) -> None:
     )
     log = tmp_path / "debug.log"
     log.write_text("")
+    # `manual` keeps pam_u2f away from this machine's FIDO devices: with a bridge installed it
+    # would otherwise make the bridge reach for the real key. The authfile is read either way.
     confdir = stack(
         tmp_path,
         f"auth required {_pam_u2f()} debug debug_file={log} authfile={authfile} "
-        f"origin={pam.ORIGIN} cue userverification=1",
+        f"origin={pam.ORIGIN} manual userverification=1",
     )
     result = pam.authenticate(confdir, "test-service", user)
-    assert not result.ok  # no FIDO device attached
+    assert not result.ok  # the conversation answers pam_u2f's challenge with nothing
     assert f"Found 1 device(s) for user {user}" in log.read_text()
 
 
