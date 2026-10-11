@@ -229,6 +229,8 @@ class SimulatedFidoKey:
         self.received: list[bytes] = []
         """Every complete request (MSG frame) that reached the key, in order."""
         self.connected = True
+        self.released = False
+        """Whether the link asked for this connection's resources to be released."""
         self.selected_revision: bytes | None = None
         self.writes: list[bytes] = []
         self.cancels = 0
@@ -252,6 +254,7 @@ class SimulatedFidoKey:
         self._notify = callback
 
     async def disconnect(self) -> None:
+        self.released = True
         if self.hang_disconnect:
             await asyncio.Event().wait()
         self.connected = False

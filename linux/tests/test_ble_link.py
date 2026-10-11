@@ -223,6 +223,19 @@ async def test_reconnects_after_the_key_powers_down() -> None:
     await link.close()
 
 
+async def test_a_link_the_key_dropped_is_still_released() -> None:
+    # On BlueZ an unreleased link keeps its notification subscription, which doubles every
+    # notification on the next connection.
+    connector = SimulatedConnector()
+    link = make_link(connector)
+    await ask(link)
+    dropped = connector.last
+    dropped.drop()
+    await asyncio.sleep(0)
+    assert dropped.released
+    await link.close()
+
+
 async def test_stale_kept_open_link_is_replaced_transparently() -> None:
     connector = SimulatedConnector()
     link = make_link(connector)

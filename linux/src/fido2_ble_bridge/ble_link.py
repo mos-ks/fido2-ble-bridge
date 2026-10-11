@@ -76,7 +76,8 @@ class GattSession(Protocol):
     async def read_control_point_length(self) -> bytes: ...
     async def write_control_point(self, fragment: bytes) -> None: ...
     async def start_status_notifications(self, callback: Callable[[bytes], None]) -> None: ...
-    async def disconnect(self) -> None: ...
+    async def disconnect(self) -> None:
+        """Release the link; also called once the key has dropped it."""
 
 
 class GattConnector(Protocol):
@@ -147,6 +148,7 @@ class FidoBleLink:
         self._events: asyncio.Queue[_Event] = asyncio.Queue(maxsize=queue_limit)
         self._lock = asyncio.Lock()
         self._idle_task: asyncio.Task[None] | None = None
+        self._releases: set[asyncio.Task[None]] = set()
 
     @property
     def connected(self) -> bool:
@@ -184,6 +186,7 @@ class FidoBleLink:
         self._stop_idle_timer()
         async with self._lock:
             await self._drop_session("shutting down")
+        await asyncio.gather(*self._releases)
 
     async def _request_locked(
         self,
@@ -442,9 +445,17 @@ class FidoBleLink:
         if generation != self._generation:
             return
         log.info("authenticator disconnected")
-        self._session = None
+        session, self._session = self._session, None
         self._assembler.reset()
         self._post(LinkError("authenticator disconnected"))
+        if session is not None:
+            # A link the key dropped still holds resources until released. On BlueZ that is
+            # bleak's D-Bus connection, and with it the notification subscription, which BlueZ
+            # keeps and re-arms on every later connection: each notification then arrives once
+            # per stale subscription, for this process and any other, and breaks reassembly.
+            release = asyncio.get_running_loop().create_task(self._disconnect_quietly(session))
+            self._releases.add(release)
+            release.add_done_callback(self._releases.discard)
 
     def _post(self, event: _Event) -> None:
         try:
