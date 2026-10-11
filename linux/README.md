@@ -411,9 +411,10 @@ The profile `/usr/share/pam-configs/fido2-ble-bridge` has two `service in …` l
   `PAM_USER=$USER PAM_SERVICE=sudo /opt/fido2-ble-bridge/bin/python -I -m
   fido2_ble_bridge.local_session; echo $?`.
 
-Wherever the key is asked, a `pam_echo` line first shows a hint (in the terminal for `sudo`,
+Wherever the key is asked, a `pam_exec` line first echoes a hint (in the terminal for `sudo`,
 under the password field on the login and lock screens), because `pam_u2f` stays silent until
-the key has answered. It can never change the result.
+the key has answered. It is not `pam_echo`, which `sudo` silences (it always authenticates
+with `PAM_SILENT`). It can never change the result.
 
 To add a service, append its PAM service name to the first list, and rerun `sudo
 pam-auth-update --enable fido2-ble-bridge`. Add it to the second list as well only if the check
@@ -441,7 +442,7 @@ module in the PAM files of your display manager and screen locker (for example
 `/etc/pam.d/gdm-password`):
 
 ```
-auth [default=ignore] pam_echo.so Bluetooth key: press its button, then touch the sensor when it lights up. No key? Wait for the password prompt.
+auth [default=ignore] pam_exec.so quiet stdout /usr/bin/echo Bluetooth key: press its button, then touch the sensor when it lights up. No key? Wait for the password prompt.
 auth sufficient pam_u2f.so authfile=/etc/fido2-ble-bridge/u2f_mappings origin=pam://fido2-ble-bridge cue userverification=1
 ```
 
@@ -450,7 +451,7 @@ of them, so that `sudo` in an SSH session skips the hint and the key:
 
 ```
 auth [success=ignore default=2] pam_exec.so quiet /opt/fido2-ble-bridge/bin/python -I -m fido2_ble_bridge.local_session
-auth [default=ignore] pam_echo.so Bluetooth key: press its button, then touch the sensor when it lights up. No key? Wait for the password prompt.
+auth [default=ignore] pam_exec.so quiet stdout /usr/bin/echo Bluetooth key: press its button, then touch the sensor when it lights up. No key? Wait for the password prompt.
 auth sufficient pam_u2f.so authfile=/etc/fido2-ble-bridge/u2f_mappings origin=pam://fido2-ble-bridge cue userverification=1
 ```
 

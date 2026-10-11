@@ -106,7 +106,7 @@ def test_pam_profile_uses_the_key_only_for_local_services() -> None:
     # A failed check skips the hint and the key.
     assert check == f"[success=ignore default=2]\tpam_exec.so quiet {pam.LOCAL_SESSION_CHECK}"
     # The hint can never change the result, and holds nothing PAM would read as syntax.
-    assert hint == f"[default=ignore]\tpam_echo.so {HINT}"
+    assert hint == f"[default=ignore]\t{pam.KEY_HINT_MODULE}"
     assert HINT == pam.KEY_HINT  # what setup prints for systems without pam-auth-update
     assert not set("[]%") & set(HINT)
     assert u2f == f"[success=end default=ignore]\tpam_u2f.so {PAM_U2F_ARGS}"
@@ -161,6 +161,18 @@ def test_the_profile_s_stack_reaches_the_key_only_where_it_should(
 
 
 @pytest.mark.skipif(not pam.available(), reason="needs Linux-PAM 1.4 or newer")
+@pytest.mark.parametrize("service", ["sudo", "gdm-password"])
+def test_the_hint_shows_when_the_caller_asks_for_silence(tmp_path: Path, service: str) -> None:
+    # sudo always calls pam_authenticate with PAM_SILENT, which silences pam_echo.
+    verdict = shutil.which("true")
+    assert verdict is not None
+    (tmp_path / service).write_text(stack_from_profile({U2F_LINE: "pam_permit.so", CHECK: verdict}))
+    result = pam.authenticate(tmp_path, service, getpass.getuser(), flags=pam.PAM_SILENT)
+    assert result.messages == [HINT]
+    assert result.ok
+
+
+@pytest.mark.skipif(not pam.available(), reason="needs Linux-PAM 1.4 or newer")
 @pytest.mark.parametrize("service", ["sudo", "su", "sshd"])
 def test_a_skipped_key_leaves_the_password_working(tmp_path: Path, service: str) -> None:
     # The failed check (or pam_succeed_if) only jumps: it must not fail the stack, or sudo in an
@@ -182,7 +194,7 @@ def test_readme_documents_the_profile_s_pam_u2f_arguments() -> None:
     assert f"auth required pam_u2f.so {PAM_U2F_ARGS}" in readme
     assert f"auth sufficient pam_u2f.so {PAM_U2F_ARGS}" in readme
     assert f"auth [success=ignore default=2] pam_exec.so quiet {pam.LOCAL_SESSION_CHECK}" in readme
-    assert f"auth [default=ignore] pam_echo.so {pam.KEY_HINT}" in readme
+    assert f"auth [default=ignore] {pam.KEY_HINT_MODULE}" in readme
     assert f"-o {pam.ORIGIN} -i {pam.ORIGIN} -V" in readme
 
 

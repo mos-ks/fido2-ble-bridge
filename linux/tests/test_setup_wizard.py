@@ -1718,5 +1718,5 @@ def test_the_manual_pam_lines_put_the_local_session_check_before_sudo_s_key(
     text = world.console.text
     # The check skips both the hint and the key.
     assert f"auth [success=ignore default=2] pam_exec.so quiet {LOCAL_SESSION_CHECK}" in text
-    assert f"auth [default=ignore] pam_echo.so {KEY_HINT}" in text
+    assert f"auth [default=ignore] pam_exec.so quiet stdout /usr/bin/echo {KEY_HINT}" in text
     assert re.search(r"/etc/pam\.d/su\b", text) is None  # sudo, but not su

@@ -1778,7 +1778,7 @@ class Setup:
         self.say("  To undo: sudo pam-auth-update --disable fido2-ble-bridge")
 
     def _manual_pam(self) -> None:
-        hint = f"auth [default=ignore] pam_echo.so {pam.KEY_HINT}"
+        hint = f"auth [default=ignore] {pam.KEY_HINT_MODULE}"
         line = f"auth sufficient pam_u2f.so {pam.u2f_arguments(DEFAULT_MAPPINGS_PATH)}"
         check = f"auth [success=ignore default=2] pam_exec.so quiet {pam.LOCAL_SESSION_CHECK}"
         self.say("  This system has no pam-auth-update, so setup does not edit PAM files. Add")

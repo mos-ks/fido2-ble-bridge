@@ -12,9 +12,9 @@ PROFILE = Path(__file__).resolve().parents[1] / "packaging" / "pam-configs" / "f
 U2F_LINE = f"pam_u2f.so {pam.u2f_arguments(Path('/etc/fido2-ble-bridge/u2f_mappings'))}"
 CHECK = pam.LOCAL_SESSION_CHECK
 HINT = next(
-    line.split("pam_echo.so ", 1)[1]
+    line.split("/usr/bin/echo ", 1)[1]
     for line in PROFILE.read_text().splitlines()
-    if "pam_echo.so " in line
+    if "/usr/bin/echo " in line
 )
 """What the profile shows before it asks the key."""
 

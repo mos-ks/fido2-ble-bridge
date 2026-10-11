@@ -21,6 +21,7 @@ PAM_PROMPT_ECHO_OFF = 1
 PAM_PROMPT_ECHO_ON = 2
 PAM_ERROR_MSG = 3
 PAM_TEXT_INFO = 4
+PAM_SILENT = 0x8000
 
 # The relying party pamu2fcfg registers with and pam_u2f checks (-o/-i and origin=). Fixed, so
 # renaming the host does not invalidate registrations.
@@ -28,13 +29,16 @@ ORIGIN = "pam://fido2-ble-bridge"
 # What the PAM profile runs through pam_exec before pam_u2f for sudo, sudo -i and login: it
 # exits 0 only for a request from a session at this computer (local_session.py).
 LOCAL_SESSION_CHECK = "/opt/fido2-ble-bridge/bin/python -I -m fido2_ble_bridge.local_session"
-# What the profile shows (pam_echo) right before pam_u2f asks the key. pam_u2f's own cue only
-# comes once the key has answered, and a sleeping key can take the whole connect timeout, so
-# without it the login stays silent until the password prompt.
+# What the profile shows right before pam_u2f asks the key. pam_u2f's own cue only comes once
+# the key has answered, and a sleeping key can take the whole connect timeout, so without it the
+# login stays silent until the password prompt. It is echoed through pam_exec's stdout option,
+# not pam_echo: sudo always authenticates with PAM_SILENT, which pam_echo obeys and pam_exec
+# does not.
 KEY_HINT = (
     "Bluetooth key: press its button, then touch the sensor when it lights up. "
     "No key? Wait for the password prompt."
 )
+KEY_HINT_MODULE = f"pam_exec.so quiet stdout /usr/bin/echo {KEY_HINT}"
 
 # pam_u2f options (its cfg.c has them all) that setup accepts in a line it enables, besides the
 # required authfile= and userverification=1. Anything else is refused: alwaysok and nouserok let
@@ -186,8 +190,11 @@ def authenticate(
     service: str,
     user: str,
     on_message: Callable[[str], None] | None = None,
+    *,
+    flags: int = 0,
 ) -> PamResult:
-    """Run pam_authenticate once for `user` with the stack in confdir/service.
+    """Run pam_authenticate once for `user` with the stack in confdir/service, with `flags`
+    (PAM_SILENT, as sudo passes it).
 
     Prompts are answered with an empty string. Informational and error messages (pam_u2f's
     "Please touch the device.") go to on_message as they arrive, and all messages are returned.
@@ -264,7 +271,7 @@ def authenticate(
         raise PamError(f"pam_start_confdir failed with PAM status {started}")
     result = PAM_CONV_ERR
     try:
-        result = int(libpam.pam_authenticate(handle, 0))
+        result = int(libpam.pam_authenticate(handle, flags))
         description = (libpam.pam_strerror(handle, result) or b"").decode(errors="replace")
     finally:
         libpam.pam_end(handle, result)
