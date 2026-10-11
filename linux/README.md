@@ -411,6 +411,10 @@ The profile `/usr/share/pam-configs/fido2-ble-bridge` has two `service in …` l
   `PAM_USER=$USER PAM_SERVICE=sudo /opt/fido2-ble-bridge/bin/python -I -m
   fido2_ble_bridge.local_session; echo $?`.
 
+Wherever the key is asked, a `pam_echo` line first shows a hint (in the terminal for `sudo`,
+under the password field on the login and lock screens), because `pam_u2f` stays silent until
+the key has answered. It can never change the result.
+
 To add a service, append its PAM service name to the first list, and rerun `sudo
 pam-auth-update --enable fido2-ble-bridge`. Add it to the second list as well only if the check
 must be skipped for it, which is safe only for services that only someone at the screen can
@@ -432,19 +436,21 @@ effect (it warns if `common-auth` was edited by hand and therefore not updated).
 absent or fails, you get the password prompt. To undo: `sudo pam-auth-update --disable
 fido2-ble-bridge`.
 
-`pam-auth-update` exists on Debian and Ubuntu. Elsewhere, add this line before the password
+`pam-auth-update` exists on Debian and Ubuntu. Elsewhere, add these lines before the password
 module in the PAM files of your display manager and screen locker (for example
 `/etc/pam.d/gdm-password`):
 
 ```
+auth [default=ignore] pam_echo.so Bluetooth key: press its button, then touch the sensor when it lights up. No key? Wait for the password prompt.
 auth sufficient pam_u2f.so authfile=/etc/fido2-ble-bridge/u2f_mappings origin=pam://fido2-ble-bridge cue userverification=1
 ```
 
-For `sudo` (`/etc/pam.d/sudo`), add the same line with the local session check in front of it,
-so that `sudo` in an SSH session skips the key:
+For `sudo` (`/etc/pam.d/sudo`), add the same two lines with the local session check in front
+of them, so that `sudo` in an SSH session skips the hint and the key:
 
 ```
-auth [success=ignore default=1] pam_exec.so quiet /opt/fido2-ble-bridge/bin/python -I -m fido2_ble_bridge.local_session
+auth [success=ignore default=2] pam_exec.so quiet /opt/fido2-ble-bridge/bin/python -I -m fido2_ble_bridge.local_session
+auth [default=ignore] pam_echo.so Bluetooth key: press its button, then touch the sensor when it lights up. No key? Wait for the password prompt.
 auth sufficient pam_u2f.so authfile=/etc/fido2-ble-bridge/u2f_mappings origin=pam://fido2-ble-bridge cue userverification=1
 ```
 
@@ -552,9 +558,12 @@ Things to know:
 
 ## Using it
 
-At a login prompt, wake the key (before or after starting the login). The bridge waits up to
+At a login prompt (the login or lock screen, `sudo` in your terminal), the profile first shows
+"Bluetooth key: press its button, then touch the sensor when it lights up. No key? Wait for the
+password prompt." Wake the key (before or after starting the login). The bridge waits up to
 `connect_timeout` seconds for it, then `pam_u2f` shows "Please touch the device." and you touch
-the sensor. If the key does not appear in time, you get the password prompt.
+the sensor. The password prompt comes only when that fails: the key does not answer in time, or
+it does not recognise your finger.
 
 - **Wait time without the key.** When you log in without the key nearby, each prompt first waits
   `connect_timeout` seconds. Lower it in the config if that bothers you.

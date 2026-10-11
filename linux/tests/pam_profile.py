@@ -11,6 +11,12 @@ from fido2_ble_bridge import pam
 PROFILE = Path(__file__).resolve().parents[1] / "packaging" / "pam-configs" / "fido2-ble-bridge"
 U2F_LINE = f"pam_u2f.so {pam.u2f_arguments(Path('/etc/fido2-ble-bridge/u2f_mappings'))}"
 CHECK = pam.LOCAL_SESSION_CHECK
+HINT = next(
+    line.split("pam_echo.so ", 1)[1]
+    for line in PROFILE.read_text().splitlines()
+    if "pam_echo.so " in line
+)
+"""What the profile shows before it asks the key."""
 
 
 def stack_from_profile(replace: Mapping[str, str], fallback_module: str = "pam_deny.so") -> str:

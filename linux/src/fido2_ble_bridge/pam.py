@@ -28,6 +28,13 @@ ORIGIN = "pam://fido2-ble-bridge"
 # What the PAM profile runs through pam_exec before pam_u2f for sudo, sudo -i and login: it
 # exits 0 only for a request from a session at this computer (local_session.py).
 LOCAL_SESSION_CHECK = "/opt/fido2-ble-bridge/bin/python -I -m fido2_ble_bridge.local_session"
+# What the profile shows (pam_echo) right before pam_u2f asks the key. pam_u2f's own cue only
+# comes once the key has answered, and a sleeping key can take the whole connect timeout, so
+# without it the login stays silent until the password prompt.
+KEY_HINT = (
+    "Bluetooth key: press its button, then touch the sensor when it lights up. "
+    "No key? Wait for the password prompt."
+)
 
 # pam_u2f options (its cfg.c has them all) that setup accepts in a line it enables, besides the
 # required authfile= and userverification=1. Anything else is refused: alwaysok and nouserok let

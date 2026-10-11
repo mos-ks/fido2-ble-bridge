@@ -4,7 +4,7 @@ status, a crash, a missing helper) makes the profile skip the key, so PAM asks f
 
 The profile runs it for sudo, sudo -i and the console's login:
 
-    [success=ignore default=1]  pam_exec.so quiet /opt/fido2-ble-bridge/bin/python -I -m ...
+    [success=ignore default=2]  pam_exec.so quiet /opt/fido2-ble-bridge/bin/python -I -m ...
 
 pam_exec starts it as a child of the program that asks (sudo, login), so it sits in that
 program's cgroup and with that in its logind session. It reads logind's state through

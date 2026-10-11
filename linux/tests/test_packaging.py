@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from pam_profile import CHECK, U2F_LINE, stack_from_profile
+from pam_profile import CHECK, HINT, U2F_LINE, stack_from_profile
 
 from fido2_ble_bridge import pam
 from fido2_ble_bridge.config import (
@@ -98,12 +98,17 @@ def _services(guard: str) -> set[str]:
 def test_pam_profile_uses_the_key_only_for_local_services() -> None:
     blocks = pam_profile_blocks()
     assert blocks["Auth"] == blocks["Auth-Initial"]
-    keyed, seat_only, check, u2f = blocks["Auth"]
-    # Not a listed service: skip the other three lines.
-    assert keyed.startswith("[success=ignore default=3]\t")
+    keyed, seat_only, check, hint, u2f = blocks["Auth"]
+    # Not a listed service: skip the other four lines.
+    assert keyed.startswith("[success=ignore default=4]\t")
     # Login screens and lock screens skip the check; everything else goes through it.
     assert seat_only.startswith("[success=1 default=ignore]\t")
-    assert check == f"[success=ignore default=1]\tpam_exec.so quiet {pam.LOCAL_SESSION_CHECK}"
+    # A failed check skips the hint and the key.
+    assert check == f"[success=ignore default=2]\tpam_exec.so quiet {pam.LOCAL_SESSION_CHECK}"
+    # The hint can never change the result, and holds nothing PAM would read as syntax.
+    assert hint == f"[default=ignore]\tpam_echo.so {HINT}"
+    assert HINT == pam.KEY_HINT  # what setup prints for systems without pam-auth-update
+    assert not set("[]%") & set(HINT)
     assert u2f == f"[success=end default=ignore]\tpam_u2f.so {PAM_U2F_ARGS}"
     assert _services(seat_only) < _services(keyed)
     assert _services(keyed) - _services(seat_only) == {"sudo", "sudo-i", "login"}
@@ -150,6 +155,8 @@ def test_the_profile_s_stack_reaches_the_key_only_where_it_should(
     )
     result = pam.authenticate(tmp_path, service, getpass.getuser())
     assert ("KEY-ASKED" in result.messages) is asks_key
+    # The hint comes first, and only where the key is asked.
+    assert result.messages[:2] == ([HINT, "KEY-ASKED"] if asks_key else [])
     assert result.ok is asks_key  # without the key, the password (pam_deny here) fails
 
 
@@ -166,6 +173,7 @@ def test_a_skipped_key_leaves_the_password_working(tmp_path: Path, service: str)
     (tmp_path / service).write_text(stack)
     result = pam.authenticate(tmp_path, service, getpass.getuser())
     assert "KEY-ASKED" not in result.messages
+    assert HINT not in result.messages
     assert result.ok
 
 
@@ -173,7 +181,8 @@ def test_readme_documents_the_profile_s_pam_u2f_arguments() -> None:
     readme = (PROJECT / "README.md").read_text()
     assert f"auth required pam_u2f.so {PAM_U2F_ARGS}" in readme
     assert f"auth sufficient pam_u2f.so {PAM_U2F_ARGS}" in readme
-    assert f"auth [success=ignore default=1] pam_exec.so quiet {pam.LOCAL_SESSION_CHECK}" in readme
+    assert f"auth [success=ignore default=2] pam_exec.so quiet {pam.LOCAL_SESSION_CHECK}" in readme
+    assert f"auth [default=ignore] pam_echo.so {pam.KEY_HINT}" in readme
     assert f"-o {pam.ORIGIN} -i {pam.ORIGIN} -V" in readme
 
 

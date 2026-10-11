@@ -1778,14 +1778,17 @@ class Setup:
         self.say("  To undo: sudo pam-auth-update --disable fido2-ble-bridge")
 
     def _manual_pam(self) -> None:
+        hint = f"auth [default=ignore] pam_echo.so {pam.KEY_HINT}"
         line = f"auth sufficient pam_u2f.so {pam.u2f_arguments(DEFAULT_MAPPINGS_PATH)}"
-        check = f"auth [success=ignore default=1] pam_exec.so quiet {pam.LOCAL_SESSION_CHECK}"
-        self.say("  This system has no pam-auth-update, so setup does not edit PAM files. Add this")
-        self.say("  line before the password line (pam_unix) in the PAM file of your display")
-        self.say("  manager or screen locker (gdm-password, sddm, lightdm, ...):")
+        check = f"auth [success=ignore default=2] pam_exec.so quiet {pam.LOCAL_SESSION_CHECK}"
+        self.say("  This system has no pam-auth-update, so setup does not edit PAM files. Add")
+        self.say("  these lines before the password line (pam_unix) in the PAM file of your")
+        self.say("  display manager or screen locker (gdm-password, sddm, lightdm, ...):")
+        self.say(f"    {hint}")
         self.say(f"    {line}")
-        self.say("  For sudo (/etc/pam.d/sudo), add the same line with this one right in front of")
-        self.say("  it, so that sudo skips the key unless it runs in a session at this computer:")
+        self.say("  For sudo (/etc/pam.d/sudo), add the same two lines with this one right in")
+        self.say("  front of them, so that sudo skips the key unless it runs in a session at this")
+        self.say("  computer:")
         self.say(f"    {check}")
         self.say("  Do not add the key to su or polkit-1 without that check: anyone on this")
         self.say("  computer, or logged in over SSH, could then make your key ask for your")

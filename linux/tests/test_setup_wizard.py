@@ -36,7 +36,7 @@ from fido2_ble_bridge.config import PLACEHOLDER_ADDRESS, Config, load_config
 from fido2_ble_bridge.console import device_name
 from fido2_ble_bridge.daemon import CheckResult
 from fido2_ble_bridge.pairing import ADAPTER, AGENT_CAPABILITY, AGENT_PATH, Bus
-from fido2_ble_bridge.pam import LOCAL_SESSION_CHECK, ORIGIN, PamResult
+from fido2_ble_bridge.pam import KEY_HINT, LOCAL_SESSION_CHECK, ORIGIN, PamResult
 from fido2_ble_bridge.setup_wizard import (
     AmbiguousDevice,
     Completed,
@@ -1716,5 +1716,7 @@ def test_the_manual_pam_lines_put_the_local_session_check_before_sudo_s_key(
     world.runner.tools.discard("pam-auth-update")
     world.setup().enable_pam(tested=True)
     text = world.console.text
-    assert f"auth [success=ignore default=1] pam_exec.so quiet {LOCAL_SESSION_CHECK}" in text
+    # The check skips both the hint and the key.
+    assert f"auth [success=ignore default=2] pam_exec.so quiet {LOCAL_SESSION_CHECK}" in text
+    assert f"auth [default=ignore] pam_echo.so {KEY_HINT}" in text
     assert re.search(r"/etc/pam\.d/su\b", text) is None  # sudo, but not su
