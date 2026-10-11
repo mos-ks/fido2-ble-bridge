@@ -175,6 +175,7 @@ class Bridge:
 
     def _reply(self, txn: int, response: Response) -> Output:
         if isinstance(response, ErrorResponse):
+            log.warning("authenticator answered with BLE error 0x%02x", response.code)
             return self._server.fail(txn, response.code)
         if isinstance(response, MsgResponse) and response.data:
             return self._server.respond(txn, response.data)

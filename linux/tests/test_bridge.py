@@ -194,6 +194,18 @@ async def test_unbonded_key_fails_closed() -> None:
     await rig.link.close()
 
 
+async def test_key_error_frames_reach_the_client_and_the_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rig = make_rig(SimulatedConnector(error_code=b"\x03"))
+    device = await rig.device()
+    with pytest.raises(CtapError) as raised:
+        await call(lambda: Ctap2(device))
+    assert raised.value.code == CtapError.ERR.INVALID_LENGTH
+    assert "authenticator answered with BLE error 0x03" in caplog.text
+    await rig.link.close()
+
+
 async def test_u2f_messages_are_refused(rig: Rig) -> None:
     device = await rig.device()
     with pytest.raises(CtapError) as raised:
