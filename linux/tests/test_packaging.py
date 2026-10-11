@@ -68,6 +68,27 @@ def test_unit_runs_the_installed_package_with_the_default_config() -> None:
         f"--config {DEFAULT_CONFIG_PATH}"
     ]
     assert unit_settings("OpenFile") == [f"/dev/uhid:{UHID_FD_NAME}"]
+    assert unit_settings("DeviceAllow") == ["/dev/uhid rw"]
+
+
+def test_service_user_is_static_and_may_reach_bluez() -> None:
+    # dbus-daemon resets connections from DynamicUser services, which cut the bridge off from
+    # BlueZ; the service runs as a sysusers.d user that a D-Bus policy lets talk to org.bluez.
+    assert unit_settings("DynamicUser") == []
+    assert unit_settings("User") == ["fido2-ble-bridge"]
+    assert unit_settings("Group") == ["fido2-ble-bridge"]
+    sysusers = (PACKAGING / "fido2-ble-bridge.sysusers").read_text().splitlines()
+    assert [line.split()[:2] for line in sysusers if line and not line.startswith("#")] == [
+        ["u", "fido2-ble-bridge"]
+    ]
+    policy = (PACKAGING / "fido2-ble-bridge-dbus.conf").read_text()
+    assert '<policy user="fido2-ble-bridge">' in policy
+    assert '<allow send_destination="org.bluez"/>' in policy
+    assert shell_variable("sysusers_path") == "/etc/sysusers.d/fido2-ble-bridge.conf"
+    assert shell_variable("dbus_policy_path") == "/etc/dbus-1/system.d/fido2-ble-bridge.conf"
+    uninstall = (PROJECT / "uninstall.sh").read_text()
+    assert "/etc/dbus-1/system.d/fido2-ble-bridge.conf" in uninstall
+    assert "/etc/sysusers.d/fido2-ble-bridge.conf" in uninstall
 
 
 def _services(guard: str) -> set[str]:

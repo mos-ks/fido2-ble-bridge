@@ -12,6 +12,8 @@ set -euo pipefail
 prefix=/opt/fido2-ble-bridge
 config_dir=/etc/fido2-ble-bridge
 unit_path=/etc/systemd/system/fido2-ble-bridge.service
+sysusers_path=/etc/sysusers.d/fido2-ble-bridge.conf
+dbus_policy_path=/etc/dbus-1/system.d/fido2-ble-bridge.conf
 launcher=/usr/local/bin/fido2-ble-bridge
 pam_profile=/usr/share/pam-configs/fido2-ble-bridge
 # Outside /usr/share/pam-configs on purpose: pam-auth-update reads every file there as a profile.
@@ -86,6 +88,12 @@ if [[ ! -e $config_dir/config.toml ]]; then
   install -m 0644 "$packaging/config.toml.example" "$config_dir/config.toml"
 fi
 install -m 0644 "$packaging/fido2-ble-bridge.service" "$unit_path"
+# The service's own system user, and a D-Bus rule that lets exactly that user reach BlueZ.
+install -D -m 0644 "$packaging/fido2-ble-bridge.sysusers" "$sysusers_path"
+systemd-sysusers "$sysusers_path"
+install -D -m 0644 "$packaging/fido2-ble-bridge-dbus.conf" "$dbus_policy_path"
+busctl call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig \
+  >/dev/null 2>&1 || true
 profile_held=0
 profile_updated=0
 if [[ -d /usr/share/pam-configs ]]; then

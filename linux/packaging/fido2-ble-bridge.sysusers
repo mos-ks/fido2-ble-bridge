@@ -1,0 +1,2 @@
+# The unprivileged system user fido2-ble-bridge.service runs as (installed to /etc/sysusers.d).
+u fido2-ble-bridge - "FIDO2 BLE bridge" - -

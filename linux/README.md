@@ -166,7 +166,7 @@ On top of that:
   over a second, it checks the link with a BLE PING carrying a random payload, and reconnects
   if the echo does not come back within a second. So a lost write response cannot make the key
   run a PIN change twice (costing a PIN retry) or ask for your fingerprint twice.
-- **Sandboxed service.** It runs as a throwaway `DynamicUser` with no capabilities, no network
+- **Sandboxed service.** It runs as a dedicated unprivileged system user (`fido2-ble-bridge`) with no capabilities, no network
   (D-Bus only), a read-only filesystem, a private `/dev` without physical devices, and a
   system-call filter.
   systemd opens the root-only `/dev/uhid` and passes the service just that file descriptor

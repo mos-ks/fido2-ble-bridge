@@ -5,9 +5,67 @@ from bleak import BleakScanner
 from bleak.args.bluez import BlueZScannerArgs
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
+from bleak.exc import BleakDBusError
+from dbus_fast import Variant
 
-from fido2_ble_bridge.ble_link import FIDO_SERVICE_UUID
-from fido2_ble_bridge.bluez import FoundKey, scan_fido_devices
+from fido2_ble_bridge import bluez
+from fido2_ble_bridge.ble_link import FIDO_SERVICE_UUID, KeyNotReachable
+from fido2_ble_bridge.bluez import (
+    FoundKey,
+    connect_with_retry,
+    device_path_for,
+    scan_fido_devices,
+)
+
+
+def test_device_path_is_found_by_address_and_adapter() -> None:
+    objects: dict[str, dict[str, dict[str, Any]]] = {
+        "/org/bluez/hci0": {"org.bluez.Adapter1": {}},
+        "/org/bluez/hci0/dev_AA_BB": {"org.bluez.Device1": {"Address": Variant("s", "aa:bb")}},
+        "/org/bluez/hci1/dev_AA_BB": {"org.bluez.Device1": {"Address": Variant("s", "AA:BB")}},
+        "/org/bluez/hci1/dev_CC_DD": {"org.bluez.Device1": {"Address": Variant("s", "CC:DD")}},
+    }
+    assert device_path_for(objects, "AA:BB", None) == "/org/bluez/hci0/dev_AA_BB"
+    assert device_path_for(objects, "AA:BB", "hci1") == "/org/bluez/hci1/dev_AA_BB"
+    assert device_path_for(objects, "EE:FF", None) is None
+    assert device_path_for(objects, "CC:DD", "hci0") is None
+
+
+class _Client:
+    def __init__(self, errors: list[str], log: list[float], timeout: float) -> None:
+        self._errors = errors
+        log.append(timeout)
+
+    async def connect(self) -> None:
+        if self._errors:
+            raise BleakDBusError(self._errors.pop(0), ["busy"])
+
+
+async def test_connect_retries_errors_that_clear_up_by_themselves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bluez, "CONNECT_RETRY_DELAY", 0.01)
+    errors = ["org.bluez.Error.InProgress", "org.bluez.Error.Failed"]
+    attempts: list[float] = []
+    client = await connect_with_retry(lambda t: _Client(errors, attempts, t), 5)  # type: ignore[arg-type,return-value]
+    assert isinstance(client, _Client)
+    assert len(attempts) == 3
+    assert all(0 < t <= 5 for t in attempts)
+
+
+async def test_connect_gives_up_at_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bluez, "CONNECT_RETRY_DELAY", 0.05)
+    errors = ["org.bluez.Error.InProgress"] * 1000
+    with pytest.raises(KeyNotReachable, match="InProgress"):
+        await connect_with_retry(lambda t: _Client(errors, [], t), 0.2)  # type: ignore[arg-type,return-value]
+
+
+async def test_connect_does_not_retry_other_errors() -> None:
+    errors = ["org.bluez.Error.AuthenticationFailed"]
+    attempts: list[float] = []
+    with pytest.raises(BleakDBusError):
+        await connect_with_retry(lambda t: _Client(errors, attempts, t), 5)  # type: ignore[arg-type,return-value]
+    assert len(attempts) == 1
 
 
 def advertised(

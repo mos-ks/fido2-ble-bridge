@@ -17,7 +17,9 @@ from typing import Any, NamedTuple
 from bleak import BleakClient, BleakScanner
 from bleak.args.bluez import BlueZClientArgs, BlueZScannerArgs
 from bleak.backends.characteristic import BleakGATTCharacteristic
+from bleak.backends.device import BLEDevice
 from bleak.backends.service import BleakGATTService
+from bleak.exc import BleakDBusError
 from dbus_fast import BusType, Message, MessageType
 from dbus_fast.aio import MessageBus
 
@@ -145,31 +147,100 @@ class BleakGattSession:
         await self._client.disconnect()
 
 
+def device_path_for(
+    objects: Mapping[str, Mapping[str, Mapping[str, Any]]], address: str, adapter: str | None
+) -> str | None:
+    """The BlueZ object path of the device with `address` (on `adapter`, if given) in the result
+    of ObjectManager.GetManagedObjects, or None if BlueZ doesn't know it."""
+    prefix = f"/org/bluez/{adapter}/" if adapter else "/org/bluez/"
+    for path, interfaces in objects.items():
+        props = interfaces.get(DEVICE_INTERFACE)
+        if props is None or not path.startswith(prefix):
+            continue
+        found = props.get("Address")
+        if str(getattr(found, "value", found)).upper() == address:
+            return path
+    return None
+
+
+async def find_device_path(address: str, adapter: str | None) -> str | None:
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    try:
+        reply = await bus.call(
+            Message(
+                destination=BLUEZ_SERVICE,
+                path="/",
+                interface="org.freedesktop.DBus.ObjectManager",
+                member="GetManagedObjects",
+            )
+        )
+    finally:
+        bus.disconnect()
+    if reply is None or reply.message_type == MessageType.ERROR:
+        return None
+    return device_path_for(reply.body[0], address, adapter)
+
+
+# Connect errors that clear up by themselves within a connect window: InProgress while another
+# connect, or the service discovery after one, is still running (BlueZ's own or another program's);
+# Failed for an LE connection attempt that ended because the key wasn't advertising yet.
+RETRYABLE_CONNECT_ERRORS = frozenset({"org.bluez.Error.InProgress", "org.bluez.Error.Failed"})
+CONNECT_RETRY_DELAY = 0.5
+
+
+async def connect_with_retry(
+    make_client: Callable[[float], BleakClient], timeout: float
+) -> BleakClient:
+    """Connects a fresh client per attempt, retrying RETRYABLE_CONNECT_ERRORS until `timeout`."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        client = make_client(max(1.0, deadline - loop.time()))
+        try:
+            await client.connect()
+            return client
+        except BleakDBusError as exc:
+            if exc.dbus_error not in RETRYABLE_CONNECT_ERRORS:
+                raise
+            if loop.time() + CONNECT_RETRY_DELAY >= deadline:
+                raise KeyNotReachable(f"connecting to the authenticator failed: {exc}") from exc
+            log.debug("BlueZ refused the connect (%s), retrying", exc.dbus_error)
+            await asyncio.sleep(CONNECT_RETRY_DELAY)
+
+
 class BleakGattConnector:
+    """Connects to the bonded key through the device object BlueZ keeps for it.
+
+    It never scans: BlueZ's LE connect itself waits for the key to advertise, and a scan would
+    race with other programs' scans and with the bridge's own (BlueZ refuses a second scan from
+    the same client with InProgress, for example after a cancelled one).
+    """
+
     def __init__(self, address: str, adapter: str | None = None) -> None:
         self._address = address.upper()
-        self._scanner_args = BlueZScannerArgs(adapter=adapter) if adapter else BlueZScannerArgs()
+        self._adapter = adapter
         self._client_args = BlueZClientArgs(adapter=adapter) if adapter else BlueZClientArgs()
 
     async def connect(self, timeout: float, on_disconnect: Callable[[], None]) -> GattSession:
-        device = await BleakScanner.find_device_by_filter(
-            lambda found, _adv: found.address.upper() == self._address,
-            timeout=timeout,
-            bluez=self._scanner_args,
-        )
-        if device is None:
-            raise KeyNotReachable(f"{self._address} did not advertise within {timeout:g}s")
-        device_path = device.details["path"]
-        check_bond(await read_bond_state(device_path), self._address)
+        device_path = await find_device_path(self._address, self._adapter)
+        if device_path is None:
+            raise KeyNotTrusted(
+                f"{self._address} is not paired with this host; run fido2-ble-bridge setup"
+            )
+        state = await read_bond_state(device_path)
+        check_bond(state, self._address)
+        device = BLEDevice(self._address, None, {"path": device_path, "props": state.device})
 
-        client = BleakClient(
-            device,
-            disconnected_callback=lambda _client: on_disconnect(),
-            services=[FIDO_SERVICE_UUID],
-            timeout=timeout,
-            bluez=self._client_args,
+        client = await connect_with_retry(
+            lambda remaining: BleakClient(
+                device,
+                disconnected_callback=lambda _client: on_disconnect(),
+                services=[FIDO_SERVICE_UUID],
+                timeout=remaining,
+                bluez=self._client_args,
+            ),
+            timeout,
         )
-        await client.connect()
         try:
             # Re-read after connecting: pairing state can change between scan and connect.
             check_bond(await read_bond_state(device_path), self._address)

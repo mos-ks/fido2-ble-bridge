@@ -11,12 +11,16 @@ ExecStart=/opt/fido2-ble-bridge/bin/python -I -m fido2_ble_bridge run --config /
 Restart=on-failure
 RestartSec=2
 
-# Unprivileged throwaway user whose private /dev has pseudo-devices such as /dev/null but no
-# physical devices. systemd opens /dev/uhid (root-only by default) as root and hands the
-# service only that open file descriptor.
-DynamicUser=yes
+# Unprivileged system user (created by install.sh through sysusers.d) whose private /dev has
+# pseudo-devices such as /dev/null but no physical devices. systemd opens /dev/uhid (root-only by
+# default) and hands the service only that open file descriptor; DeviceAllow lets that open pass
+# the device policy PrivateDevices sets up. Not DynamicUser: dbus-daemon resets connections from
+# dynamic users, which cut the service off from BlueZ.
+User=fido2-ble-bridge
+Group=fido2-ble-bridge
 OpenFile=/dev/uhid:uhid
 PrivateDevices=yes
+DeviceAllow=/dev/uhid rw
 
 # Talks to BlueZ over the system D-Bus socket only.
 PrivateNetwork=yes

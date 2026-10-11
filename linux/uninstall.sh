@@ -19,6 +19,11 @@ fi
 systemctl disable --now fido2-ble-bridge 2>/dev/null || true
 rm -f /etc/systemd/system/fido2-ble-bridge.service
 systemctl daemon-reload
+rm -f /etc/dbus-1/system.d/fido2-ble-bridge.conf /etc/sysusers.d/fido2-ble-bridge.conf
+busctl call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig \
+  >/dev/null 2>&1 || true
+# The service user owns no files; remove it too.
+userdel fido2-ble-bridge 2>/dev/null || true
 rm -rf /opt/fido2-ble-bridge
 rm -f /usr/local/bin/fido2-ble-bridge /etc/modules-load.d/fido2-ble-bridge.conf
 if [[ ${1:-} == "--purge" ]]; then
