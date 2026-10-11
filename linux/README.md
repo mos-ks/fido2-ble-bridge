@@ -574,6 +574,11 @@ password prompt." Wake the key (before or after starting the login). The bridge 
 the sensor. The password prompt comes only when that fails: the key does not answer in time, or
 it does not recognise your finger.
 
+- **Faster with the key awake.** Press the key's button just before you start the login (as you
+  press Enter on `sudo`, say): the bridge then connects as soon as it asks, instead of waiting
+  for the key to wake. With a Feitian AllinPass K33 it took 3.7 to 4.2 s from the start of a
+  login until "Please touch the device.", most of it the key waking and the connection being
+  set up.
 - **Wait time without the key.** When you log in without the key nearby, each prompt first waits
   `connect_timeout` seconds. Lower it in the config if that bothers you.
 - **GNOME keyring.** The login keyring is encrypted with your password, so after a passwordless
@@ -694,6 +699,21 @@ push.
 Setup lives in `src/fido2_ble_bridge/setup_wizard.py`, with BlueZ pairing in `pairing.py` and the
 PAM test in `pam.py`. Every system effect goes through small injectable pieces, so
 `tests/test_setup_wizard.py` runs each step against the fakes in `tests/setup_fakes.py`.
+
+### Possible speedups, not done
+
+Measured on a K33 at a 20 ms connection interval, where each request to the key takes two to
+four intervals:
+
+- **`nodetect` on the `pam_u2f` line** skips pam_u2f's first request, which only checks that the
+  key holds the credential: about 0.2 to 0.4 s per login. With a backup key also registered,
+  pam_u2f would then no longer know which key to ask first.
+- **A shorter handshake:** write the FIDO2 revision without reading the key's revision bitfield
+  first, and reuse the control point length from the last connection: about 0.1 s.
+- **System-wide BlueZ settings:** scanning at full duty while connecting, and turning off
+  bluetoothd's battery and device-information plugins, which read the key on every connection:
+  perhaps 0.2 to 0.5 s, but they apply to every Bluetooth device (GNOME would show no battery
+  levels, for one).
 
 ## License
 
